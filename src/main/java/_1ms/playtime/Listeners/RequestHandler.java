@@ -31,6 +31,7 @@ import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.scheduler.ScheduledTask;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -44,13 +45,13 @@ public class RequestHandler {
     private final ConfigHandler configHandler;
     private final Gson gson = new Gson();
     private ScheduledTask task;
-    private final HashMap<RegisteredServer, ScheduledTask> rsTasks = new HashMap<>();
+    private final Map<RegisteredServer, ScheduledTask> rsTasks = new ConcurrentHashMap<>();
     public RequestHandler(Main main, PlaytimeTopCommand playtimeTopCommand, ConfigHandler configHandler) {
         this.main = main;
         this.configHandler = configHandler;
     }
-    private final Set<RegisteredServer> pttServers = new HashSet<>();
-    private final Set<RegisteredServer> ptServers = new HashSet<>();
+    private final Set<RegisteredServer> pttServers = ConcurrentHashMap.newKeySet();
+    private final Set<RegisteredServer> ptServers = ConcurrentHashMap.newKeySet();
 
     public void sendRS() {
         @SuppressWarnings("UnstableApiUsage")
@@ -82,10 +83,9 @@ public class RequestHandler {
             switch (req) {
                 case "cc" -> {
                     final RegisteredServer server22 = conn.getServer();
-                    try {
-                        rsTasks.get(server22).cancel();
-                        rsTasks.remove(server22);
-                    } catch (Exception ignored) {}
+                    final ScheduledTask rsTask = rsTasks.remove(server22);
+                    if(rsTask != null)
+                        rsTask.cancel();
                 }
                 case "rpt" -> {
                     final RegisteredServer server22 = conn.getServer();
@@ -98,7 +98,7 @@ public class RequestHandler {
                             while (iterator.hasNext()) {
                                 String Pname = iterator.next();
                                 long Ptime = main.getSavedPt(Pname);
-                                TempCache.put(Pname, Ptime);
+                                TempCache.merge(main.getDisplayName(Pname), Ptime, Math::max);
                                 iterator.remove();
                             }
                         }
@@ -110,9 +110,8 @@ public class RequestHandler {
                     outA.writeBoolean(configHandler.isPRELOAD_PLACEHOLDERS());
                     conn.getServer().sendPluginMessage(main.MCI, outA.toByteArray());
 
-                    if(ptServers.contains(server22))
+                    if(!ptServers.add(server22))
                         return;
-                    ptServers.add(server22);
                     final AtomicReference<RegisteredServer> serverRef = new AtomicReference<>(server22);
 
                     final AtomicLong currt = new AtomicLong(System.currentTimeMillis());
@@ -122,7 +121,7 @@ public class RequestHandler {
                             currt.set(rCurrt);
                             main.checkServerStatus(serverRef.get()).thenAccept(status -> {
                                 if(!status) //If the server gets stopped before 10 secs of it being started.
-                                    pttServers.removeIf(serv -> serv.equals(serverRef.get()));
+                                    pttServers.remove(serverRef.get());
                                 if (!status || pttServers.contains(serverRef.get())) {
                                     taskIn.cancel();
                                     ptServers.remove(serverRef.get());
@@ -132,7 +131,9 @@ public class RequestHandler {
                         final HashMap<String, Long> pTempMap = new HashMap<>();
                         serverRef.get().getPlayersConnected().forEach(player -> {
                             final String name = player.getUsername();
-                            pTempMap.put(name, main.playtimeCache.get(name));
+                            final Long playtime = main.playtimeCache.get(main.getDataKey(player));
+                            if(playtime != null)
+                                pTempMap.put(name, playtime);
                         });
                         final ByteArrayDataOutput out = ByteStreams.newDataOutput();
                         out.writeUTF("pt");
@@ -158,7 +159,7 @@ public class RequestHandler {
                                 task = null;
                                 return;
                             }
-                            final String json = gson.toJson(getFullTL());
+                            final String json = gson.toJson(getFullDisplayTL());
                             final ByteArrayDataOutput out = ByteStreams.newDataOutput();
                             out.writeUTF("ptt");
                             out.writeUTF(json);
@@ -173,11 +174,13 @@ public class RequestHandler {
     public LinkedHashMap<String, Long> getFullTL() {
         final HashMap<String, Long> pTempMap = new HashMap<>(main.playtimeCache);
 
-        main.getIterator().forEachRemaining(player -> {
-            if(!pTempMap.containsKey(player)) {
-                pTempMap.put(player, main.getSavedPt(player));
-            }
-        });
+        final Iterator<String> iterator = main.getIterator();
+        if(iterator != null)
+            iterator.forEachRemaining(player -> {
+                if(!pTempMap.containsKey(player)) {
+                    pTempMap.put(player, main.getSavedPt(player));
+                }
+            });
 
         return pTempMap.entrySet().stream()
                 .sorted(Map.Entry.<String, Long>comparingByValue().reversed()) // Sort by pt
@@ -185,6 +188,15 @@ public class RequestHandler {
                         Map.Entry::getKey,
                         Map.Entry::getValue,
                         (e1, e2) -> e1,
+                        LinkedHashMap::new));
+    }
+
+    public LinkedHashMap<String, Long> getFullDisplayTL() {
+        return getFullTL().entrySet().stream()
+                .collect(Collectors.toMap(
+                        entry -> main.getDisplayName(entry.getKey()),
+                        Map.Entry::getValue,
+                        Math::max,
                         LinkedHashMap::new));
     }
 }

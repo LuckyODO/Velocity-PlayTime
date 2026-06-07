@@ -47,9 +47,7 @@ public class MySQLHandler {
 
         try {
             conn = DriverManager.getConnection(url, configHandler.getUSERNAME(), configHandler.getPASSWORD());
-            try (Statement s = conn.createStatement()) {
-                s.execute("CREATE TABLE IF NOT EXISTS playtimes (name VARCHAR(20) PRIMARY KEY, time BIGINT NOT NULL)");
-            }
+            ensureSchema();
         } catch (SQLException e) {
             main.getLogger().error("Error while connecting to the database: {}", e.getMessage());
             return false;
@@ -57,12 +55,37 @@ public class MySQLHandler {
         return true;
     }
 
-    public void saveData(final String name, final long time) {
+    private void ensureSchema() throws SQLException {
+        try (Statement s = conn.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS playtimes (name VARCHAR(36) PRIMARY KEY, time BIGINT NOT NULL, last_name VARCHAR(16))");
+            if(getColumnSize("name") < 36)
+                s.execute("ALTER TABLE playtimes MODIFY COLUMN name VARCHAR(36) NOT NULL");
+            if(!columnExists("last_name"))
+                s.execute("ALTER TABLE playtimes ADD COLUMN last_name VARCHAR(16)");
+        }
+    }
+
+    private boolean columnExists(String columnName) throws SQLException {
+        return getColumnSize(columnName) > 0;
+    }
+
+    private int getColumnSize(String columnName) throws SQLException {
+        DatabaseMetaData metaData = conn.getMetaData();
+        try(ResultSet rs = metaData.getColumns(conn.getCatalog(), null, "playtimes", columnName)) {
+            if(rs.next())
+                return rs.getInt("COLUMN_SIZE");
+        }
+        return 0;
+    }
+
+    public void saveData(final String name, final String lastName, final long time) {
         for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("INSERT INTO playtimes (name, time) VALUES (?, ?) ON DUPLICATE KEY UPDATE time = ?")) {
+            try(PreparedStatement pstmt = conn.prepareStatement("INSERT INTO playtimes (name, time, last_name) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE time = ?, last_name = ?")) {
                 pstmt.setString(1, name);
                 pstmt.setLong(2, time);
-                pstmt.setLong(3, time);
+                pstmt.setString(3, lastName);
+                pstmt.setLong(4, time);
+                pstmt.setString(5, lastName);
                 pstmt.executeUpdate();
                 break;
             } catch (SQLException e) {
@@ -71,6 +94,25 @@ public class MySQLHandler {
                     continue;
                 }
                 throw new RuntimeException("Error while saving data into the database", e);
+            }
+        }
+    }
+
+    public void saveName(final String name, final String lastName) {
+        if(lastName == null || lastName.isBlank())
+            return;
+        for(int i = 0; i < 2; i++) {
+            try(PreparedStatement pstmt = conn.prepareStatement("UPDATE playtimes SET last_name = ? WHERE name = ?")) {
+                pstmt.setString(1, lastName);
+                pstmt.setString(2, name);
+                pstmt.executeUpdate();
+                break;
+            } catch (SQLException e) {
+                if(e instanceof SQLNonTransientConnectionException) {
+                    openConnection();
+                    continue;
+                }
+                throw new RuntimeException("Error while saving player name into the database", e);
             }
         }
     }
@@ -96,10 +138,55 @@ public class MySQLHandler {
         return -999;
     }
 
+    public String readName(final String name) {
+        for(int i = 0; i < 2; i++) {
+            try(PreparedStatement pstmt = conn.prepareStatement("SELECT last_name FROM playtimes WHERE name = ?")) {
+                pstmt.setString(1, name);
+                try(ResultSet rs = pstmt.executeQuery()) {
+                    if(rs.next()) {
+                        final String lastName = rs.getString("last_name");
+                        return lastName == null || lastName.isBlank() ? name : lastName;
+                    }
+                }
+                return name;
+            } catch (SQLException e) {
+                if(e instanceof SQLNonTransientConnectionException) {
+                    openConnection();
+                    continue;
+                }
+                throw new RuntimeException("Error while reading player name from the database", e);
+            }
+        }
+        main.getLogger().error("DB name read error - Invalid state.");
+        return name;
+    }
+
+    public String findKeyByName(final String playerName) {
+        for(int i = 0; i < 2; i++) {
+            try(PreparedStatement pstmt = conn.prepareStatement("SELECT name FROM playtimes WHERE LOWER(last_name) = LOWER(?)")) {
+                pstmt.setString(1, playerName);
+                try(ResultSet rs = pstmt.executeQuery()) {
+                    if(rs.next())
+                        return rs.getString("name");
+                }
+                return null;
+            } catch (SQLException e) {
+                if(e instanceof SQLNonTransientConnectionException) {
+                    openConnection();
+                    continue;
+                }
+                throw new RuntimeException("Error while finding player key from the database", e);
+            }
+        }
+        main.getLogger().error("DB key lookup error - Invalid state.");
+        return null;
+    }
+
     public Iterator<String> getIterator() {
         final Set<String> playtimes = new HashSet<>();
         for (int i = 0; i < 2; i++) {
-            try(ResultSet rs = conn.prepareStatement("SELECT name FROM playtimes").executeQuery()) {
+            try(PreparedStatement pstmt = conn.prepareStatement("SELECT name FROM playtimes");
+                ResultSet rs = pstmt.executeQuery()) {
                 while (rs.next())
                     playtimes.add(rs.getString("name"));
                 return playtimes.iterator(); //Fill up and then  ret
@@ -127,6 +214,22 @@ public class MySQLHandler {
                     continue;
                 }
                 throw new RuntimeException("Error while saving data into the database",e);
+            }
+        }
+    }
+
+    public void deleteData(final String name) {
+        for(int i = 0; i < 2; i++) {
+            try(PreparedStatement pstmt = conn.prepareStatement("DELETE FROM playtimes WHERE name = ?")) {
+                pstmt.setString(1, name);
+                pstmt.executeUpdate();
+                break;
+            } catch (SQLException e) {
+                if(e instanceof SQLNonTransientConnectionException) {
+                    openConnection();
+                    continue;
+                }
+                throw new RuntimeException("Error while deleting data from the database",e);
             }
         }
     }

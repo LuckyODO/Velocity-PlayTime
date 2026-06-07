@@ -46,14 +46,10 @@ public class CacheHandler {
             iterator.remove();
         }
 
-        for(int i = 0; i < configHandler.getTOPLIST_LIMIT(); i++) {
-            Optional<Map.Entry<String, Long>> member = TempCache.entrySet().stream().max(Map.Entry.comparingByValue());
-            if(member.isEmpty())
-                break;
-            Map.Entry<String, Long> Entry = member.get();
-            main.playtimeCache.put(Entry.getKey(), Entry.getValue());
-            TempCache.remove(Entry.getKey());
-        }
+        TempCache.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(configHandler.getTOPLIST_LIMIT())
+                .forEach(entry -> main.playtimeCache.put(entry.getKey(), entry.getValue()));
         main.getLogger().info("The cache has been built, took: {} ms", cacheGenTime = (System.currentTimeMillis() - start) + configHandler.getGenTime());
     }
 
@@ -84,16 +80,17 @@ public class CacheHandler {
 
     public void updateCache() {//Runs at the interval defined in the config
         HashMap<String, Long> TempCache = generateTempCache();
-        for (int i = 0; i < main.playtimeCache.size() - configHandler.getTOPLIST_LIMIT(); i++) { //Check players on the server only, not the toplist
-            String member = TempCache.entrySet().stream()
-                    .min(Map.Entry.comparingByValue())
-                    .map(Map.Entry::getKey)
-                    .orElseThrow();
-
-            Optional<Player> player = main.getProxy().getPlayer(member); //V Check if the pt has already been saved.
-            if(player.isEmpty() && main.playtimeCache.get(member) == main.getSavedPt(member))
-                main.playtimeCache.remove(member);
-            TempCache.remove(member);
+        final List<Map.Entry<String, Long>> sortedEntries = TempCache.entrySet().stream()
+                .sorted(Map.Entry.comparingByValue())
+                .toList();
+        for (Map.Entry<String, Long> entry : sortedEntries) { //Check players on the server only, not the toplist
+            if(main.playtimeCache.size() <= configHandler.getTOPLIST_LIMIT())
+                break;
+            String member = entry.getKey();
+            Optional<Player> player = main.getPlayerByDataKey(member); //V Check if the pt has already been saved.
+            final Long currentPlaytime = main.playtimeCache.get(member);
+            if(player.isEmpty() && currentPlaytime != null && currentPlaytime == main.getSavedPt(member))
+                main.playtimeCache.remove(member, currentPlaytime);
         }
     }
 }

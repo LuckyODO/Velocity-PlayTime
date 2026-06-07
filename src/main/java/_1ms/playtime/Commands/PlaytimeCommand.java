@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 public class PlaytimeCommand implements SimpleCommand {
     private final Main main;
@@ -63,11 +64,13 @@ public class PlaytimeCommand implements SimpleCommand {
                     sender.sendMessage(configHandler.getNO_PERMISSION());
                     return;
                 }
-                long PlayTime = main.playtimeCache.containsKey(args[0]) ? main.playtimeCache.get(args[0]) : main.getSavedPt(args[0]);
+                final String targetKey = main.resolveDataKey(args[0]);
+                final Long cachedPlaytime = main.playtimeCache.get(targetKey);
+                long PlayTime = cachedPlaytime != null ? cachedPlaytime : main.getSavedPt(targetKey);
                 if (PlayTime == -1)
                     sender.sendMessage(configHandler.getNO_PLAYER());
                 else
-                    sender.sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getOTHER_PLAYTIME(), PlayTime).replace("%player%", args[0]).replace("%place%", String.valueOf(main.getPlace(args[0])))));
+                    sender.sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getOTHER_PLAYTIME(), PlayTime).replace("%player%", main.getDisplayName(targetKey)).replace("%place%", String.valueOf(main.getPlace(targetKey)))));
             }
             case 3 -> {
                 if(!sender.hasPermission("vpt.modify")) {
@@ -83,45 +86,54 @@ public class PlaytimeCommand implements SimpleCommand {
                     sender.sendMessage(configHandler.getINVALID_VALUE());
                     return;
                 }
-                switch (args[0]) {
+                if(!args[0].equalsIgnoreCase("add") && !args[0].equalsIgnoreCase("sub") && !args[0].equalsIgnoreCase("set")) {
+                    sender.sendMessage(configHandler.getINVALID_ARGS());
+                    return;
+                }
+                final String targetKey = main.resolveDataKey(args[1]);
+                String targetName = main.getDisplayName(targetKey);
+                if(targetName.equals(targetKey))
+                    targetName = args[1];
+                switch (args[0].toLowerCase()) {
                     case "add" -> {//pt add %player% %time%
                         long val;
                         long beforePt;
-                        if(main.playtimeCache.containsKey(args[1])) {//In cache
-                            beforePt = main.playtimeCache.get(args[1]);
+                        Long cachedPlaytime = main.playtimeCache.get(targetKey);
+                        if(cachedPlaytime != null) {//In cache
+                            beforePt = cachedPlaytime;
                             val = beforePt+num;
-                            main.playtimeCache.replace(args[1], val);
-                            if(main.getProxy().getPlayer(args[1]).isEmpty()) //Save if player ain't on.
-                                main.savePt(args[1], val);
+                            main.playtimeCache.replace(targetKey, val);
+                            if(main.getPlayerByDataKey(targetKey).isEmpty()) //Save if player ain't on.
+                                main.savePt(targetKey, targetName, val);
                         } else {
-                            beforePt = main.getSavedPt(args[1]);//Config if not
+                            beforePt = main.getSavedPt(targetKey);//Config if not
                             if(beforePt == -1) {
                                 sender.sendMessage(configHandler.getNO_PLAYER());
                                 return;
                             }
                             val = beforePt+num;
-                            main.savePt(args[1], val);
-                            var tempMap = cacheHandler.generateTempCache();
-                            if((long)tempMap.values().toArray()[tempMap.size()-1] < val) { //Put in cache if last val in it smaller than the added PT, the clearer will kill it later.
-                                main.playtimeCache.put(args[1], val);
+                            main.savePt(targetKey, targetName, val);
+                            if(shouldCache(val)) { //Put in cache if the new PT can enter the current toplist, the clearer will kill it later.
+                                main.playtimeCache.put(targetKey, val);
                             }
                         }
-                        checkRewards(args[1], beforePt, val);
-                        sendModMsg(val, sender, args[1]);
+                        checkRewards(targetName, beforePt, val);
+                        sendModMsg(val, sender, targetName);
                     }
                     case "sub" -> {
                         long val;
-                        if(main.playtimeCache.containsKey(args[1])) {//In cache
-                            val = main.playtimeCache.get(args[1])-num;
+                        Long cachedPlaytime = main.playtimeCache.get(targetKey);
+                        if(cachedPlaytime != null) {//In cache
+                            val = cachedPlaytime-num;
                             if(val < 0){
                                 sender.sendMessage(configHandler.getINVALID_VALUE());
                                 return;
                             }
-                            handleCache(args[1], val);
-                            if(main.getProxy().getPlayer(args[1]).isEmpty())
-                                main.savePt(args[1], val);
+                            handleCache(targetKey, val);
+                            if(main.getPlayerByDataKey(targetKey).isEmpty())
+                                main.savePt(targetKey, targetName, val);
                         } else {
-                            final long pt = main.getSavedPt(args[1]);//Config if not
+                            final long pt = main.getSavedPt(targetKey);//Config if not
                             if(pt == -1) {
                                 sender.sendMessage(configHandler.getNO_PLAYER());
                                 return;
@@ -131,28 +143,30 @@ public class PlaytimeCommand implements SimpleCommand {
                                 sender.sendMessage(configHandler.getINVALID_VALUE());
                                 return;
                             }
-                            main.savePt(args[1], val);
+                            main.savePt(targetKey, targetName, val);
                         }
-                        sendModMsg(val, sender, args[1]);
+                        sendModMsg(val, sender, targetName);
                     }
                     case "set" -> {
                         long beforePt;
-                        if(main.playtimeCache.containsKey(args[1])) {//In cache
-                            beforePt = main.playtimeCache.get(args[1]);
-                            handleCache(args[1], num);
-                            if(main.getProxy().getPlayer(args[1]).isEmpty())
-                                main.savePt(args[1],num);
+                        Long cachedPlaytime = main.playtimeCache.get(targetKey);
+                        if(cachedPlaytime != null) {//In cache
+                            beforePt = cachedPlaytime;
+                            handleCache(targetKey, num);
+                            if(main.getPlayerByDataKey(targetKey).isEmpty())
+                                main.savePt(targetKey, targetName, num);
                         }
                         else {
-                            beforePt = main.getSavedPt(args[1]);
+                            beforePt = main.getSavedPt(targetKey);
                             if(beforePt == -1)
                                 beforePt = 0;
-                            main.savePt(args[1], num);
+                            main.savePt(targetKey, targetName, num);
                         }
                         if(beforePt < num)
-                            checkRewards(args[1], beforePt, num);
-                        sendModMsg(num, sender, args[1]);
+                            checkRewards(targetName, beforePt, num);
+                        sendModMsg(num, sender, targetName);
                     }
+                    default -> sender.sendMessage(configHandler.getINVALID_ARGS());
                 }
             }
             default -> sender.sendMessage(configHandler.getINVALID_ARGS());
@@ -160,27 +174,21 @@ public class PlaytimeCommand implements SimpleCommand {
     }
 
     private void checkRewards(String pname, long beforePt, long afterPt) {
+        final boolean shouldReward = main.getProxy().getPlayer(pname)
+                .map(player -> !player.hasPermission("vpt.rewards.exempt"))
+                .orElse(configHandler.isOFFLINES_SHOULD_GET_REWARDS());
+        if(!shouldReward)
+            return;
         configHandler.getRewardsH().forEach((key, value) -> { //Check rewards on PT ADD
-            try {
-                if(beforePt < key && key <= afterPt && !main.getProxy().getPlayer(pname).orElseThrow().hasPermission("vpt.rewards.exempt")) {
-                    delay();//We need to delay by 100ms, otherwise lp will delay them, but execute in the wrong order.
-                    main.getProxy().getCommandManager().executeAsync(main.getProxy().getConsoleCommandSource(), value.replace("%player%", pname));
-                }
-            } catch (Exception ignored) {
-                if(configHandler.isOFFLINES_SHOULD_GET_REWARDS()) {
-                    delay();
-                    main.getProxy().getCommandManager().executeAsync(main.getProxy().getConsoleCommandSource(), value.replace("%player%", pname));
-                }
-            }
+            if(beforePt < key && key <= afterPt)
+                scheduleReward(pname, value);
         });
     }
 
-    private void delay() {
-        try {
-            Thread.sleep(100);
-        } catch (InterruptedException e) {
-            throw new RuntimeException("Error while delaying rewards cmd.", e);
-        }
+    private void scheduleReward(String pname, String command) {
+        main.getProxy().getScheduler().buildTask(main, () ->
+                main.getProxy().getCommandManager().executeAsync(main.getProxy().getConsoleCommandSource(), command.replace("%player%", pname))
+        ).delay(100, TimeUnit.MILLISECONDS).schedule();
     }
 
     private void sendModMsg(long val, CommandSource sender, String target) {
@@ -191,16 +199,35 @@ public class PlaytimeCommand implements SimpleCommand {
     public void handleCache(final String pname, final long val) {
         final LinkedHashMap<String, Long> tempMap = main.doSort(null);
         main.playtimeCache.replace(pname, val);
-        if((long)tempMap.values().toArray()[tempMap.size()-1] > val)
+        final Long lowestTopPlaytime = main.getLastValue(tempMap);
+        if(lowestTopPlaytime != null && lowestTopPlaytime > val)
             cacheHandler.upd2(pname);
     }
+
+    private boolean shouldCache(long playtime) {
+        final var tempMap = cacheHandler.generateTempCache();
+        if(tempMap.size() < configHandler.getTOPLIST_LIMIT())
+            return true;
+        return tempMap.values().stream()
+                .min(Long::compare)
+                .map(lowestPlaytime -> lowestPlaytime < playtime)
+                .orElse(true);
+    }
+
     public void SendYourPlaytime(Player player) {
         if (configHandler.isVIEW_OWN_TIME() && !player.hasPermission("vpt.getowntime")) {
             player.sendMessage(configHandler.getNO_PERMISSION());
             return;
         }
-        final long PlayTime = main.playtimeCache.get(player.getUsername());
-        player.sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getYOUR_PLAYTIME(), PlayTime).replace("%place%", String.valueOf(main.getPlace(player.getUsername())))));
+        final String playerKey = main.getDataKey(player);
+        Long PlayTime = main.playtimeCache.get(playerKey);
+        if(PlayTime == null) {
+            PlayTime = main.getSavedPt(playerKey);
+            if(PlayTime == -1)
+                PlayTime = 0L;
+            main.playtimeCache.putIfAbsent(playerKey, PlayTime);
+        }
+        player.sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getYOUR_PLAYTIME(), PlayTime).replace("%place%", String.valueOf(main.getPlace(playerKey)))));
     }
 
     @Override

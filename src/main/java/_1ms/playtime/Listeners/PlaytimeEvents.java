@@ -37,31 +37,43 @@ public class PlaytimeEvents {
     @Subscribe
     public EventTask onConnect(PostLoginEvent e) {
         return EventTask.async(() -> { //Note it is async.
-            String playerName = e.getPlayer().getUsername();
-            if(!main.playtimeCache.containsKey(playerName)) {//Only put if not cached already.
-                long playtime = main.getSavedPt(playerName);
+            Player player = e.getPlayer();
+            String playerName = player.getUsername();
+            String playerKey = main.getDataKey(player);
+            if(main.playtimeCache.get(playerKey) == null) {//Only put if not cached already.
+                long playtime = main.getSavedPt(playerKey);
+                if(playtime == -1 && configHandler.isUSE_UUIDS()) {
+                    long legacyPlaytime = main.getSavedPt(playerName);
+                    if(legacyPlaytime != -1) {
+                        playtime = legacyPlaytime;
+                        main.savePt(playerKey, playerName, legacyPlaytime);
+                        main.removePt(playerName);
+                        main.playtimeCache.remove(playerName);
+                    }
+                }
                 if (playtime == -1) {//Here, first time joined.
-                    main.playtimeCache.put(playerName, 0L);
+                    main.playtimeCache.putIfAbsent(playerKey, 0L);
+                    main.savePlayerName(playerKey, playerName);
                     return;
                 }
-                main.playtimeCache.put(playerName, playtime); //LOAD pt from before.
+                main.playtimeCache.putIfAbsent(playerKey, playtime); //LOAD pt from before.
             }
+            main.savePlayerName(playerKey, playerName);
         });
     }
 
     @Subscribe
     public EventTask onLeave(DisconnectEvent e) {
         return EventTask.async(() -> {
-            final String playerName = e.getPlayer().getUsername();
-            long playerTime;
-            try {//Ret if null, bugfix for when the player leaves too quickly.
-                playerTime = main.playtimeCache.get(playerName);
-            } catch (Exception ex) {
+            final Player player = e.getPlayer();
+            final String playerName = player.getUsername();
+            final String playerKey = main.getDataKey(player);
+            final Long playerTime = main.playtimeCache.get(playerKey);
+            if(playerTime == null) //Ret if null, bugfix for when the player leaves too quickly.
                 return;
-            }
-            main.savePt(playerName, playerTime);
+            main.savePt(playerKey, playerName, playerTime);
             if(!configHandler.isUSE_CACHE()) //Rem if caching isnt used, otherwise updateCache task clears it when needed
-                main.playtimeCache.remove(playerName);
+                main.playtimeCache.remove(playerKey);
         });
     }
 
@@ -70,30 +82,34 @@ public class PlaytimeEvents {
         return EventTask.async(() -> {
             Player player = e.getPlayer();
             if(configHandler.isVIEW_OWN_TIME() && configHandler.isVIEW_OTHERS_TIME() && !player.hasPermission("vpt.getowntime") && !player.hasPermission("vpt.getotherstime")) {
-                e.getRootNode().removeChildByName("playtime");
-                e.getRootNode().removeChildByName("pt");
+                removeChildByName(e, "playtime");
+                removeChildByName(e, "pt");
             }
             if(configHandler.isVIEW_TOPLIST() && !player.hasPermission("vpt.gettoplist")) {
-                e.getRootNode().removeChildByName("playtimetop");
-                e.getRootNode().removeChildByName("pttop");
-                e.getRootNode().removeChildByName("ptt");
+                removeChildByName(e, "playtimetop");
+                removeChildByName(e, "pttop");
+                removeChildByName(e, "ptt");
             }
             if(!player.hasPermission("vpt.reload")) {
-                e.getRootNode().removeChildByName("playtimereload");
-                e.getRootNode().removeChildByName("ptrl");
-                e.getRootNode().removeChildByName("ptreload");
+                removeChildByName(e, "playtimereload");
+                removeChildByName(e, "ptrl");
+                removeChildByName(e, "ptreload");
             }
             if(!player.hasPermission("vpt.ptreset")) {
-                e.getRootNode().removeChildByName("playtimereset");
-                e.getRootNode().removeChildByName("ptr");
-                e.getRootNode().removeChildByName("ptreset");
+                removeChildByName(e, "playtimereset");
+                removeChildByName(e, "ptr");
+                removeChildByName(e, "ptreset");
             }
             if(!player.hasPermission("vpt.ptresetall")) {
-                e.getRootNode().removeChildByName("playtimeresetall");
-                e.getRootNode().removeChildByName("ptra");
-                e.getRootNode().removeChildByName("ptresetall");
+                removeChildByName(e, "playtimeresetall");
+                removeChildByName(e, "ptra");
+                removeChildByName(e, "ptresetall");
             }
         });
+    }
+
+    private void removeChildByName(PlayerAvailableCommandsEvent event, String name) {
+        event.getRootNode().getChildren().removeIf(child -> child.getName().equals(name));
     }
 
     //Cachee, unnecessary to check after every player leave + unstable probably

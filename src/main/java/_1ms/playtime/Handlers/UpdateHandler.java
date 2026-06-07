@@ -27,6 +27,7 @@ import java.net.URISyntaxException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 
 public class UpdateHandler {
     private final Main main;
@@ -39,7 +40,9 @@ public class UpdateHandler {
 //        final String latestVersion = new Gson().fromJson(HttpClient.newHttpClient().send(HttpRequest.newBuilder().uri(new URI("https://api.modrinth.com/v2/project/playtime-velocity/version")).GET().build(),
 //                HttpResponse.BodyHandlers.ofString()).body(), JsonArray.class).get(0).getAsJsonObject().get("version_number").getAsString();
         final String latestV = getLatest();
-        if (latestV != null && !BuildConstants.VERSION.equals(latestV))
+        if (latestV == null) {
+            main.getLogger().warn("Could not check for updates.");
+        } else if (!BuildConstants.VERSION.equals(latestV))
             main.getLogger().warn("New version available: {}.", latestV);
         else
             main.getLogger().info("You are using the latest version.");
@@ -48,12 +51,16 @@ public class UpdateHandler {
     String getLatest() {
         try (HttpClient client = HttpClient.newHttpClient()) {
             HttpResponse<String> resp = client.send(HttpRequest.newBuilder().uri(
-                    new URI("https://api.modrinth.com/v2/project/playtime-velocity/version")).GET().build(),
+                    new URI("https://api.modrinth.com/v2/project/playtime-velocity/version")).timeout(Duration.ofSeconds(10)).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             JsonArray respArr = new Gson().fromJson(resp.body(), JsonArray.class);
             return respArr.get(0).getAsJsonObject().get("version_number").getAsString();
-        } catch (URISyntaxException | IOException | InterruptedException e) {
-            throw new RuntimeException("Error while searching for updates.",e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            main.getLogger().warn("Update check was interrupted.", e);
+        } catch (URISyntaxException | IOException | RuntimeException e) {
+            main.getLogger().warn("Error while searching for updates.", e);
         }
+        return null;
     }
 }

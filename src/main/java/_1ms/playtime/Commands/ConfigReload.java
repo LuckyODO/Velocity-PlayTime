@@ -19,6 +19,7 @@ package _1ms.playtime.Commands;
 import _1ms.playtime.Handlers.ConfigHandler;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
+import net.kyori.adventure.text.Component;
 
 public class ConfigReload implements SimpleCommand {
     private final ConfigHandler configHandler;
@@ -39,7 +40,12 @@ public class ConfigReload implements SimpleCommand {
             sender.sendMessage(configHandler.getINVALID_ARGS());
             return;
         }
-        configHandler.reloadConfig();
-        sender.sendMessage(configHandler.getCONFIG_RELOAD());
+        try {
+            configHandler.reloadConfig();
+            sender.sendMessage(configHandler.getCONFIG_RELOAD());
+        } catch (RuntimeException e) {
+            sender.sendMessage(Component.text("The config reload failed. Check the proxy console for details."));
+            throw e;
+        }
     }
 }

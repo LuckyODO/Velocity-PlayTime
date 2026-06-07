@@ -1,6 +1,6 @@
 #Velocity playtime logger.
 #Don't change the below 2, "isDataFileUpToDate" should be false, it's normal.
-file-version: 12
+file-version: 13
 isDataFileUpToDate: false
 Messages:
   NO_CONSOLE_USE: <red>The console doesn't have a playtime.</red>
@@ -44,6 +44,8 @@ Data:
   CONFIG_SERIALIZER: MINIMESSAGE
   #Choices are: "YMLFILE" or "DATABASE".
   DATA_METHOD: YMLFILE
+  #Enable this on online-mode servers so playtime follows Mojang UUIDs when players change names. Restart required.
+  USE_UUIDS: false
   DATABASE: #Only applies if you chose DATABASE as DATA_METHOD, leave password at null if the db doesn't have one, ex: jdbc:mariadb://127.0.0.1:3306/playtime?user=root&password=
     ADDRESS: 127.0.0.1
     PORT: 3306

@@ -93,8 +93,8 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private boolean isDataFileUpToDate;
     private boolean minimessage;
     private long genTime;
-    private long start;
     private boolean OFFLINES_SHOULD_GET_REWARDS;
+    private boolean USE_UUIDS;
 
     private final TreeMap<Long, String> rewardsH = new TreeMap<>(); //TreeMap bc it needs to be ordered by the Long
     private String[] excludedSrvs = {};
@@ -142,6 +142,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     public void makeConfigCache() {
+        final long cacheStart = System.currentTimeMillis();
         minimessage = config.getString("Data.CONFIG_SERIALIZER").equals("MINIMESSAGE");
         NO_PERMISSION = initComp("Messages.NO_PERMISSION");
         NO_CONSOLE_USE = initComp("Messages.NO_CONSOLE_USE");
@@ -176,33 +177,51 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         //Rewards.
         OFFLINES_SHOULD_GET_REWARDS = config.getBoolean("Data.OFFLINES_SHOULD_GET_REWARDS");
 
-        getConfigIterator("Rewards", false).forEachRemaining(key -> rewardsH.put(Long.valueOf(key), config.getString("Rewards." + key)));
-        genTime = System.currentTimeMillis() - start;
-        try {
-            excludedSrvs = config.getString("Data.EXCLUDED_SERVERS").split(",");
-        } catch (Exception ignored) {} //IF empty
+        final TreeMap<Long, String> rewards = new TreeMap<>();
+        getConfigIterator("Rewards", false).forEachRemaining(key -> {
+            try {
+                rewards.put(Long.valueOf(key), config.getString("Rewards." + key));
+            } catch (NumberFormatException e) {
+                main.getLogger().warn("Ignoring invalid reward playtime '{}'. Reward keys must be seconds.", key);
+            }
+        });
+        synchronized (rewardsH) {
+            rewardsH.clear();
+            rewardsH.putAll(rewards);
+        }
+        genTime = System.currentTimeMillis() - cacheStart;
+        excludedSrvs = splitConfigList(config.getString("Data.EXCLUDED_SERVERS"));
 
     }
 
     public void makeNonChanging() {
-        start = System.currentTimeMillis();
         USE_CACHE = config.getBoolean("Data.CACHING.USE_CACHE");
         CACHE_UPDATE_INTERVAL = config.getLong("Data.CACHING.CACHE_UPDATE_INTERVAL");
         BSTATS = config.getBoolean("Data.BSTATS");
         CHECK_FOR_UPDATES = config.getBoolean("Data.CHECK_FOR_UPDATES");
         isDataFileUpToDate = config.getBoolean("isDataFileUpToDate");
         DATABASE = config.getString("Data.DATA_METHOD").equals("DATABASE");
+        USE_UUIDS = config.getBoolean("Data.USE_UUIDS");
         PRELOAD_PLACEHOLDERS = config.getBoolean("Data.PRELOAD_PLACEHOLDERS");
         if(USE_CACHE)
             TOPLIST_LIMIT = config.getInt("Data.TOPLIST_LIMIT");//CMDS, non reloadable as they are only registered once.
         PTN = config.getString("Commands.playtime.MAIN_CMD");
-        PTA = config.getString("Commands.playtime.ALIASES").split(",");
+        PTA = splitConfigList(config.getString("Commands.playtime.ALIASES"));
         PTTN = config.getString("Commands.playtimetop.MAIN_CMD");
-        PTTA = config.getString("Commands.playtimetop.ALIASES").split(",");
+        PTTA = splitConfigList(config.getString("Commands.playtimetop.ALIASES"));
         PTRLN = config.getString("Commands.playtimereload.MAIN_CMD");
-        PTRLA = config.getString("Commands.playtimereload.ALIASES").split(",");
+        PTRLA = splitConfigList(config.getString("Commands.playtimereload.ALIASES"));
         PTRAN = config.getString("Commands.playtimeresetall.MAIN_CMD");
-        PTRAA = config.getString("Commands.playtimeresetall.ALIASES").split(",");
+        PTRAA = splitConfigList(config.getString("Commands.playtimeresetall.ALIASES"));
+    }
+
+    private String[] splitConfigList(String value) {
+        if(value == null || value.isBlank())
+            return new String[0];
+        return Arrays.stream(value.split(","))
+                .map(String::trim)
+                .filter(entry -> !entry.isEmpty())
+                .toArray(String[]::new);
     }
 
     public Iterator<String> getConfigIterator(String path, boolean isData) {
@@ -226,13 +245,42 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         return String.valueOf(i);
     }
 
-    public long getPtFromConfig(String name) {
-        final Optional<Long> pt = dataConfig.getOptionalLong("Player-Data." + name + ".playtime");
+    public long getPtFromConfig(String key) {
+        final Optional<Long> pt = dataConfig.getOptionalLong("Player-Data." + key + ".playtime");
         return pt.isPresent() ? pt.get() : -1;
     }
 
-    public void savePtToConfig(String name, long time) {
-        dataConfig.set("Player-Data." + name + ".playtime", time);
+    public void savePtToConfig(String key, String playerName, long time) {
+        dataConfig.set("Player-Data." + key + ".playtime", time);
+        if(playerName != null && !playerName.isBlank())
+            dataConfig.set("Player-Data." + key + ".name", playerName);
+        saveData();
+    }
+
+    public void saveNameToConfig(String key, String playerName) {
+        if(playerName == null || playerName.isBlank())
+            return;
+        dataConfig.set("Player-Data." + key + ".name", playerName);
+        saveData();
+    }
+
+    public String getNameFromConfig(String key) {
+        final String playerName = dataConfig.getString("Player-Data." + key + ".name");
+        return playerName == null || playerName.isBlank() ? key : playerName;
+    }
+
+    public String getKeyFromConfigName(String playerName) {
+        Iterator<String> iterator = getConfigIterator("Player-Data", true);
+        while(iterator.hasNext()) {
+            final String key = iterator.next();
+            if(getNameFromConfig(key).equalsIgnoreCase(playerName))
+                return key;
+        }
+        return null;
+    }
+
+    public void removePtFromConfig(String key) {
+        dataConfig.set("Player-Data." + key, null);
         saveData();
     }
 
@@ -261,9 +309,11 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     public void reloadConfig() {
         try {
             config.reload();
+            config.update();
+            config.save();
             makeConfigCache();
-            if(DATABASE)
-                main.loadDB();
+            if(DATABASE && !main.loadDB())
+                throw new RuntimeException("Database reload failed.");
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -287,6 +337,16 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
                 .replace("%totalhours%", String.valueOf(main.calcTotalPT(PlayTime, 'h')))
                 .replace("%totalminutes%", String.valueOf(main.calcTotalPT(PlayTime, 'm')))
                 .replace("%totalseconds%", String.valueOf(main.calcTotalPT(PlayTime, 's')));
+    }
+
+    public NavigableMap<Long, String> getRewardsH() {
+        synchronized (rewardsH) {
+            return new TreeMap<>(rewardsH);
+        }
+    }
+
+    public String[] getExcludedSrvs() {
+        return excludedSrvs.clone();
     }
 
 }

@@ -56,7 +56,7 @@ public class PlaytimeResetAll implements SimpleCommand {
                 }
                 main.removeAllPt();
                 main.playtimeCache.keySet().removeIf(pname -> {
-                    Optional<Player> player = main.getProxy().getPlayer(pname);
+                    Optional<Player> player = main.getPlayerByDataKey(pname);
                     if (player.isPresent()) {
                         main.playtimeCache.replace(pname, 0L);
                         return false;

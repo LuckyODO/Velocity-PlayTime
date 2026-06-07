@@ -51,6 +51,7 @@ import java.nio.file.Path;
 import java.sql.SQLException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 @Plugin(
@@ -74,7 +75,7 @@ public class Main {
     public MySQLHandler mySQLHandler;
     public final MinecraftChannelIdentifier MCI = MinecraftChannelIdentifier.from("velocity:playtime");
 
-    private final HashMap<String, SpamData> spamH = new HashMap<>();
+    private final ConcurrentHashMap<String, SpamData> spamH = new ConcurrentHashMap<>();
     public record SpamData(boolean isTop, long time){}
 
     public void InitInstances() {
@@ -90,7 +91,7 @@ public class Main {
         playtimeResetAll = new PlaytimeResetAll(this, configHandler);
     }
 
-    public final HashMap<String, Long> playtimeCache = new HashMap<>();
+    public final ConcurrentHashMap<String, Long> playtimeCache = new ConcurrentHashMap<>();
 
     @Getter
     private final Logger logger;
@@ -147,7 +148,7 @@ public class Main {
 //Convert old data cfgs from ms to sec. If isDataFileUpToDate has been set to true, then the plugin already ran, so there is pt, otherwise it's already been converted or never been ran.
         if(configHandler.isDataFileUpToDate()) {
             getLogger().info("Converting playtime from ms to seconds...");
-            getIterator().forEachRemaining(c -> savePt(c, getSavedPt(c) / 1000));
+            getIterator().forEachRemaining(c -> savePt(c, getDisplayName(c), getSavedPt(c) / 1000));
             configHandler.modifyMainConfig("isDataFileUpToDate", false);
         }
 
@@ -219,27 +220,35 @@ public class Main {
     }
 
     void countPT() {//Playtime counting happens here.
+        final String[] excludedServers = configHandler.getExcludedSrvs();
+        final NavigableMap<Long, String> rewards = configHandler.getRewardsH();
         proxy.getAllPlayers().forEach(p->{
-            long pt;
+            String key = getDataKey(p);
             String pname = p.getUsername();
-            try {
-                pt = playtimeCache.get(pname);
-            } catch (Exception e) {
+            if(isOnExcludedServer(p, excludedServers))
                 return;
-            }
-            for(String srv : configHandler.getExcludedSrvs()) { //Don't count if the player is on an excluded srv.
-                final var Csrv = p.getCurrentServer();
-                if (Csrv.isPresent() && Objects.equals(Csrv.get().getServerInfo().getName(), srv))
-                    return;
-            }
-            playtimeCache.replace(pname, pt+1L);
-            configHandler.getRewardsH().forEach((key, val) -> { //And rewards
+            Long newPt = playtimeCache.computeIfPresent(key, (ignored, pt) -> pt + 1L);
+            if(newPt == null)
+                return;
+            rewards.forEach((rewardTime, val) -> { //And rewards
                 try {
-                    if(Objects.equals(key, pt) && !proxy.getPlayer(pname).orElseThrow().hasPermission("vpt.rewards.exempt"))
+                    if(Objects.equals(rewardTime, newPt) && !p.hasPermission("vpt.rewards.exempt"))
                         proxy.getCommandManager().executeAsync(proxy.getConsoleCommandSource(), val.replace("%player%", pname));
                 } catch (Exception ignored) {}
             });
         });
+    }
+
+    private boolean isOnExcludedServer(Player player, String[] excludedServers) {
+        final var currentServer = player.getCurrentServer();
+        if(currentServer.isEmpty())
+            return false;
+        final String serverName = currentServer.get().getServerInfo().getName();
+        for(String excludedServer : excludedServers) {
+            if(Objects.equals(serverName, excludedServer))
+                return true;
+        }
+        return false;
     }
 
     public CompletableFuture<Boolean> checkServerStatus(RegisteredServer server) {
@@ -250,8 +259,18 @@ public class Main {
 
     @Subscribe
     public void ProxyShutdownEvent(ProxyShutdownEvent event) {
+        saveOnlinePlayers();
         mySQLHandler.closeConnection();
         logger.info("Velocity PlayTime Unloaded.");
+    }
+
+    private void saveOnlinePlayers() {
+        for(Player player : proxy.getAllPlayers()) {
+            final String playerKey = getDataKey(player);
+            final Long playerTime = playtimeCache.get(playerKey);
+            if(playerTime != null)
+                savePt(playerKey, player.getUsername(), playerTime);
+        }
     }
 
     public List<String> calcTab(CommandSource sender, String[] target) {
@@ -273,16 +292,74 @@ public class Main {
         return tabargs;
     }
 
+    public String getDataKey(Player player) {
+        return configHandler.isUSE_UUIDS() ? player.getUniqueId().toString() : player.getUsername();
+    }
+
+    public Optional<Player> getPlayerByDataKey(String key) {
+        if(configHandler.isUSE_UUIDS()) {
+            try {
+                return proxy.getPlayer(UUID.fromString(key));
+            } catch (IllegalArgumentException ignored) {}
+        }
+        return proxy.getPlayer(key);
+    }
+
+    public String resolveDataKey(String playerName) {
+        Optional<Player> onlinePlayer = proxy.getPlayer(playerName);
+        if(onlinePlayer.isPresent())
+            return getDataKey(onlinePlayer.get());
+        if(playtimeCache.get(playerName) != null)
+            return playerName;
+        if(configHandler.isUSE_UUIDS()) {
+            final String storedKey = configHandler.isDATABASE() ? mySQLHandler.findKeyByName(playerName) : configHandler.getKeyFromConfigName(playerName);
+            if(storedKey != null)
+                return storedKey;
+        }
+        return playerName;
+    }
+
+    public String getDisplayName(String key) {
+        Optional<Player> onlinePlayer = getPlayerByDataKey(key);
+        if(onlinePlayer.isPresent())
+            return onlinePlayer.get().getUsername();
+        if(!configHandler.isUSE_UUIDS())
+            return key;
+        return configHandler.isDATABASE() ? mySQLHandler.readName(key) : configHandler.getNameFromConfig(key);
+    }
+
     public long getSavedPt(String name) {
         return configHandler.isDATABASE() ? mySQLHandler.readData(name) : configHandler.getPtFromConfig(name);
     }
 
     public void savePt(String name, long time) {
+        savePt(name, getDisplayName(name), time);
+    }
+
+    public void savePt(String name, String playerName, long time) {
         if(configHandler.isDATABASE()) {
-            mySQLHandler.saveData(name, time);
+            mySQLHandler.saveData(name, playerName, time);
             return;
         }
-        configHandler.savePtToConfig(name, time);
+        configHandler.savePtToConfig(name, playerName, time);
+    }
+
+    public void savePlayerName(String key, String playerName) {
+        if(!configHandler.isUSE_UUIDS())
+            return;
+        if(configHandler.isDATABASE()) {
+            mySQLHandler.saveName(key, playerName);
+            return;
+        }
+        configHandler.saveNameToConfig(key, playerName);
+    }
+
+    public void removePt(String name) {
+        if(configHandler.isDATABASE()) {
+            mySQLHandler.deleteData(name);
+            return;
+        }
+        configHandler.removePtFromConfig(name);
     }
 
     public void removeAllPt() {
@@ -319,7 +396,7 @@ public class Main {
             case 'w' -> rawValue / 604800;
             case 'd' -> (rawValue % 604800) / 86400;
             case 'h' -> ((rawValue % 604800) % 86400) / 3600;
-            case 'm' -> (((rawValue % 604000) % 86400) % 3600) / 60;
+            case 'm' -> (((rawValue % 604800) % 86400) % 3600) / 60;
             case 's' -> ((((rawValue % 604800) % 86400) % 3600) % 60);
             default -> -1;
         };
@@ -337,9 +414,11 @@ public class Main {
 
     public int getPlace(String pName) {//Check if the cache contains it.
         LinkedHashMap<String, Long> tl;
-        if(playtimeCache.containsKey(pName)) {
+        final Long cachedPlaytime = playtimeCache.get(pName);
+        if(cachedPlaytime != null) {
             tl = doSort(null);
-            if ((long) tl.values().toArray()[tl.size() - 1] > playtimeCache.get(pName))
+            final Long lowestTopPlaytime = getLastValue(tl);
+            if (lowestTopPlaytime != null && lowestTopPlaytime > cachedPlaytime)
                 tl = requestHandler.getFullTL();
         }
         else
@@ -359,26 +438,30 @@ public class Main {
         final LinkedHashMap<String, Long> placeholderH  = new LinkedHashMap<>();
         if(!isForPlaceholder)
             invocation.source().sendMessage(configHandler.getTOP_PLAYTIME_HEADER());
-        int in = 0;
-        for(int i = 0; i < configHandler.getTOPLIST_LIMIT(); i++) {
-            in++;
-            Optional<Map.Entry<String, Long>> member = TempCache != null ? TempCache.entrySet().stream().max(Map.Entry.comparingByValue()) : Optional.empty();
-            if(member.isEmpty())
-                break;
-            Map.Entry<String, Long> Entry = member.get();
-            long playTime = Entry.getValue();
-            if(playTime == 0)
-                continue;
-
+        final List<Map.Entry<String, Long>> sortedEntries = TempCache == null ? Collections.emptyList() : TempCache.entrySet().stream()
+                .filter(entry -> entry.getValue() > 0)
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(configHandler.getTOPLIST_LIMIT())
+                .toList();
+        int place = 1;
+        for(Map.Entry<String, Long> Entry : sortedEntries) {
+            final long playTime = Entry.getValue();
             if(isForPlaceholder)
                 placeholderH.put(Entry.getKey(), playTime);
             else
-                invocation.source().sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getTOP_PLAYTIME_LIST(), playTime).replace("%player%", Entry.getKey()).replace("%place%", String.valueOf(in))));
-            TempCache.remove(Entry.getKey());
+                invocation.source().sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getTOP_PLAYTIME_LIST(), playTime).replace("%player%", getDisplayName(Entry.getKey())).replace("%place%", String.valueOf(place))));
+            place++;
         }
         if(!isForPlaceholder)
             invocation.source().sendMessage(configHandler.getTOP_PLAYTIME_FOOTER());
         return placeholderH;
+    }
+
+    public Long getLastValue(LinkedHashMap<String, Long> map) {
+        Long lastValue = null;
+        for(Long value : map.values())
+            lastValue = value;
+        return lastValue;
     }
 
 }

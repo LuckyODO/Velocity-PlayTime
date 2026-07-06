@@ -69,6 +69,7 @@ tasks {
 }
 
 shadowJar {
+    archiveClassifier.set('')
     relocate 'dev.dejvokep.boostedyaml', 'libs'
     relocate 'org.jetbrains.annotations', 'libs'
     relocate 'org.bstats', 'libs'
@@ -84,6 +85,14 @@ shadowJar {
         into ''
     }
     duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+jar {
+    enabled = false
+}
+
+assemble {
+    dependsOn shadowJar
 }
 
 sourceSets.main.java.srcDir(generateTemplates.map { it.outputs })

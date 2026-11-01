@@ -17,6 +17,7 @@
 package _1ms.playtime.Commands;
 
 import _1ms.playtime.Handlers.ConfigHandler;
+import _1ms.playtime.Handlers.StorageException;
 import _1ms.playtime.Main;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
@@ -49,30 +50,20 @@ public class PlaytimeTopCommand implements SimpleCommand {
         }
         if(main.checkSpam(true, sender))
             return;
-        main.doSort(invocation);
+        try {
+            main.doSort(invocation);
+        } catch (StorageException failure) {
+            sender.sendMessage(configHandler.getSTORAGE_ERROR());
+            main.getLogger().error("Could not read the playtime leaderboard", failure);
+        }
     }
 
     public HashMap<String, Long> getInRuntime() {
-        Iterator<String> iterator = main.getIterator();
-        final HashMap<String, Long> TempCache = new HashMap<>();
-        if(iterator != null) {
-            while (iterator.hasNext()) {
-                String Pname = iterator.next();
-                Optional<Player> player = main.getPlayerByDataKey(Pname);
-                if (player.isEmpty()) {
-                    long Ptime = main.getSavedPt(Pname);
-                    TempCache.put(Pname, Ptime);
-                }
-                iterator.remove();
-            }
-        }
-
-        main.playtimeCache.forEach((playerKey, playTime) -> {
-            Optional<Player> player = main.getPlayerByDataKey(playerKey);
-            player.ifPresent(ignored -> TempCache.put(playerKey, playTime));
-        });
+        final HashMap<String, Long> TempCache = new HashMap<>(main.getSavedPlaytimes());
+        // Also include departing players whose failed save is pending retry.
+        TempCache.putAll(main.playtimeCache);
         return TempCache.entrySet().stream()
-                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .sorted(Main.PLAYTIME_ORDER)
                 .limit(configHandler.getTOPLIST_LIMIT())
                 .collect(HashMap::new, (map, entry) -> map.put(entry.getKey(), entry.getValue()), HashMap::putAll);
     }

@@ -1,8 +1,9 @@
 #Velocity playtime logger.
 #Don't change the below 2, "isDataFileUpToDate" should be false, it's normal.
-file-version: 13
+file-version: 14
 isDataFileUpToDate: false
 Messages:
+  STORAGE_ERROR: <red>Storage is unavailable. Cached changes are retained for retry; please contact an administrator.</red>
   NO_CONSOLE_USE: <red>The console doesn't have a playtime.</red>
   PLAYTIME_YOURS: '<gradient:#00800E:#00FF1C>----------------------</gradient>\n<gradient:#F58410:#FFF800>Your playtime: %weeks% weeks %days% days %hours% hours %minutes% minutes %seconds% secs.</gradient> <gradient:#F58410:#FFF800>Place: %place%</gradient>\n<gradient:#00800E:#00FF1C>----------------------</gradient>'
   NO_PLAYER: <gradient:#F51010:#FF5300>No player found with this name.</gradient>
@@ -35,6 +36,8 @@ Commands:
 
 Data:
   TOPLIST_LIMIT: 10
+  #Save cached playtimes every 60 seconds, independently of caching. Restart required; minimum 1000 ms.
+  AUTOSAVE_INTERVAL: 60000
   BSTATS: true
   #If you have issues with the placeholders, like pt not loading in welcome messages, try enabling this.
   PRELOAD_PLACEHOLDERS: false

@@ -17,10 +17,10 @@
 package _1ms.playtime.Handlers;
 
 import _1ms.playtime.Main;
-import com.velocitypowered.api.proxy.Player;
 import lombok.Getter;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class CacheHandler {
     private final Main main;
@@ -32,65 +32,49 @@ public class CacheHandler {
         this.main = main;
         this.configHandler = configHandler;
     }
-    public void buildCache() {
-        Iterator<String> iterator = main.getIterator();
-        if(iterator == null)
-            return;
-        long start = System.currentTimeMillis();
-        main.getLogger().info("Building Cache...");
-        final HashMap<String, Long> TempCache = new HashMap<>();
-        while (iterator.hasNext()) {
-            String Pname = iterator.next();
-            long Ptime = main.getSavedPt(Pname);
-            TempCache.put(Pname, Ptime);
-            iterator.remove();
-        }
 
-        TempCache.entrySet().stream()
-                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
-                .limit(configHandler.getTOPLIST_LIMIT())
-                .forEach(entry -> main.playtimeCache.put(entry.getKey(), entry.getValue()));
-        main.getLogger().info("The cache has been built, took: {} ms", cacheGenTime = (System.currentTimeMillis() - start) + configHandler.getGenTime());
+    public void buildCache() {
+        long start = System.currentTimeMillis();
+        updateCache();
+        cacheGenTime = System.currentTimeMillis() - start + configHandler.getGenTime();
+        main.getLogger().info("The cache has been built, took: {} ms", cacheGenTime);
     }
 
     public HashMap<String, Long> generateTempCache() {
         return new HashMap<>(main.playtimeCache);
     }
 
-    public void upd2(String keyToRemove) {//Put next largest value
-        Iterator<String> iterator = main.getIterator();
-        if(iterator == null)
-            return;
-        final HashMap<String, Long> TempCache = new HashMap<>(); //Load all values from config except the one given
-        while (iterator.hasNext()) {
-            String Pname = iterator.next();
-            if(Objects.equals(Pname, keyToRemove))
-                continue;
-            long Ptime = main.getSavedPt(Pname);
-            TempCache.put(Pname, Ptime);
-            iterator.remove();
+    public void updateCache() {
+        synchronized(main) {
+            refreshCache();
         }
-
-        Optional<Map.Entry<String, Long>> nextLargest = TempCache.entrySet().stream() //Put the next largest value to the cache
-                .filter(entry -> !main.playtimeCache.containsKey(entry.getKey()))
-                .max(Map.Entry.comparingByValue());
-
-        nextLargest.ifPresent(entry -> main.playtimeCache.put(entry.getKey(), entry.getValue()));
     }
 
-    public void updateCache() {//Runs at the interval defined in the config
-        HashMap<String, Long> TempCache = generateTempCache();
-        final List<Map.Entry<String, Long>> sortedEntries = TempCache.entrySet().stream()
-                .sorted(Map.Entry.comparingByValue())
-                .toList();
-        for (Map.Entry<String, Long> entry : sortedEntries) { //Check players on the server only, not the toplist
-            if(main.playtimeCache.size() <= configHandler.getTOPLIST_LIMIT())
-                break;
-            String member = entry.getKey();
-            Optional<Player> player = main.getPlayerByDataKey(member); //V Check if the pt has already been saved.
-            final Long currentPlaytime = main.playtimeCache.get(member);
-            if(player.isEmpty() && currentPlaytime != null && currentPlaytime == main.getSavedPt(member))
-                main.playtimeCache.remove(member, currentPlaytime);
-        }
+    private void refreshCache() {
+        // Read storage first: on failure leave the existing cache intact.
+        Map<String, Long> saved = main.getSavedPlaytimes();
+        Map<String, Long> candidates = new HashMap<>(saved);
+        candidates.putAll(main.playtimeCache);
+        candidates.entrySet().stream()
+                .sorted(Main.PLAYTIME_ORDER)
+                .limit(configHandler.getTOPLIST_LIMIT())
+                .forEach(entry -> main.playtimeCache.putIfAbsent(entry.getKey(), entry.getValue()));
+
+        Set<String> leaders = main.playtimeCache.entrySet().stream()
+                .sorted(Main.PLAYTIME_ORDER)
+                .limit(configHandler.getTOPLIST_LIMIT())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toSet());
+        // Retain the UNION of top N and online players, plus anything not yet persisted.
+        main.playtimeCache.forEach((key, time) -> {
+            if(!leaders.contains(key)) {
+                main.playtimeCache.computeIfPresent(key, (ignored, current) -> {
+                    if(main.getPlayerByDataKey(key).isEmpty() && !main.hasPendingSave(key)
+                            && Objects.equals(current, saved.get(key)))
+                        return null;
+                    return current;
+                });
+            }
+        });
     }
 }

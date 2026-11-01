@@ -30,9 +30,16 @@ import lombok.Getter;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 
-import java.io.File;
+import java.io.InputStream;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.charset.StandardCharsets;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -42,6 +49,10 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private final Main main;
     @Getter(AccessLevel.NONE)
     private YamlDocument dataConfig;
+    @Getter(AccessLevel.NONE)
+    private Path dataFile;
+    @Getter(AccessLevel.NONE)
+    private Path configFile;
     @Getter(AccessLevel.NONE)
     private YamlDocument config;
 
@@ -68,6 +79,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private String USERNAME;
     private String PASSWORD;
     private Component INVALID_VALUE;
+    private Component STORAGE_ERROR;
     private String PTN;
     private String[] PTA;
     private String PTTN;
@@ -87,6 +99,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private boolean CHECK_FOR_UPDATES;
     private boolean USE_CACHE;
     private long CACHE_UPDATE_INTERVAL;
+    private long AUTOSAVE_INTERVAL;
     private boolean VIEW_OWN_TIME;
     private boolean VIEW_OTHERS_TIME;
     private boolean VIEW_TOPLIST;
@@ -101,17 +114,11 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
 
     public void initConfig(@DataDirectory Path dataDirectory) {
         try {
-            config = YamlDocument.create(new File(dataDirectory.toFile(), "config.yml"),
-                    Objects.requireNonNull(getClass().getResourceAsStream("/config.yml")),
-                    GeneralSettings.DEFAULT,
-                    LoaderSettings.builder().setAutoUpdate(true).build(),
-                    DumperSettings.DEFAULT,
-                    UpdaterSettings.builder().setVersioning(new BasicVersioning("file-version"))
-                            .setOptionSorting(UpdaterSettings.OptionSorting.SORT_BY_DEFAULTS).build()
-            );
-
+            Files.createDirectories(dataDirectory);
+            configFile = dataDirectory.resolve("config.yml");
+            config = loadYaml(configFile, "/config.yml");
             config.update();
-            config.save();
+            config.save(configFile.toFile());
 
             makeNonChanging();
             makeConfigCache();
@@ -124,17 +131,24 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     private void initDataConf(@DataDirectory Path dataDirectory) throws IOException {
-        dataConfig = YamlDocument.create(new File(dataDirectory.toFile(), "playtimes.yml"),
-                Objects.requireNonNull(getClass().getResourceAsStream("/playtimes.yml")),
-                GeneralSettings.DEFAULT,
-                LoaderSettings.builder().setAutoUpdate(true).build(),
-                DumperSettings.DEFAULT,
-                UpdaterSettings.builder().setVersioning(new BasicVersioning("file-version"))
-                        .setOptionSorting(UpdaterSettings.OptionSorting.SORT_BY_DEFAULTS).build()
-        );
-
+        dataFile = dataDirectory.resolve("playtimes.yml");
+        dataConfig = loadYaml(dataFile, "/playtimes.yml");
         dataConfig.update();
-        dataConfig.save();
+        saveData();
+    }
+
+    private YamlDocument loadYaml(Path file, String defaults) throws IOException {
+        // The library's File-based reload leaves its input stream open. Own the
+        // streams explicitly so Windows can replace the data file on autosave.
+        try(InputStream input = Files.exists(file) ? Files.newInputStream(file) : InputStream.nullInputStream();
+            InputStream resource = Objects.requireNonNull(getClass().getResourceAsStream(defaults))) {
+            return YamlDocument.create(input, resource,
+                    GeneralSettings.DEFAULT,
+                    LoaderSettings.builder().setAutoUpdate(true).build(),
+                    DumperSettings.DEFAULT,
+                    UpdaterSettings.builder().setVersioning(new BasicVersioning("file-version"))
+                            .setOptionSorting(UpdaterSettings.OptionSorting.SORT_BY_DEFAULTS).build());
+        }
     }
 
     private String getConfStr(final String path) {
@@ -160,6 +174,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         NO_SPAM = getConfStr("Messages.NO_SPAM");
         SPAM_LIMIT = config.getInt("Data.SPAM_LIMIT");
         INVALID_VALUE = initComp("Messages.INVALID_VALUE");
+        STORAGE_ERROR = initComp("Messages.STORAGE_ERROR");
         if(DATABASE) {
             ADDRESS = config.getString("Data.DATABASE.ADDRESS");
             PORT  = config.getInt("Data.DATABASE.PORT");
@@ -173,7 +188,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         VIEW_OTHERS_TIME = config.getBoolean("Data.PERMISSIONS.VIEW_OTHERS_TIME");
         VIEW_TOPLIST = config.getBoolean("Data.PERMISSIONS.VIEW_TOPLIST");
         if(!USE_CACHE)
-            TOPLIST_LIMIT = config.getInt("Data.TOPLIST_LIMIT");
+            TOPLIST_LIMIT = Math.max(1, config.getInt("Data.TOPLIST_LIMIT"));
         //Rewards.
         OFFLINES_SHOULD_GET_REWARDS = config.getBoolean("Data.OFFLINES_SHOULD_GET_REWARDS");
 
@@ -196,7 +211,8 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
 
     public void makeNonChanging() {
         USE_CACHE = config.getBoolean("Data.CACHING.USE_CACHE");
-        CACHE_UPDATE_INTERVAL = config.getLong("Data.CACHING.CACHE_UPDATE_INTERVAL");
+        CACHE_UPDATE_INTERVAL = Math.max(1000L, config.getLong("Data.CACHING.CACHE_UPDATE_INTERVAL"));
+        AUTOSAVE_INTERVAL = Math.max(1000L, config.getLong("Data.AUTOSAVE_INTERVAL"));
         BSTATS = config.getBoolean("Data.BSTATS");
         CHECK_FOR_UPDATES = config.getBoolean("Data.CHECK_FOR_UPDATES");
         isDataFileUpToDate = config.getBoolean("isDataFileUpToDate");
@@ -204,7 +220,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         USE_UUIDS = config.getBoolean("Data.USE_UUIDS");
         PRELOAD_PLACEHOLDERS = config.getBoolean("Data.PRELOAD_PLACEHOLDERS");
         if(USE_CACHE)
-            TOPLIST_LIMIT = config.getInt("Data.TOPLIST_LIMIT");//CMDS, non reloadable as they are only registered once.
+            TOPLIST_LIMIT = Math.max(1, config.getInt("Data.TOPLIST_LIMIT"));//CMDS, non reloadable as they are only registered once.
         PTN = config.getString("Commands.playtime.MAIN_CMD");
         PTA = splitConfigList(config.getString("Commands.playtime.ALIASES"));
         PTTN = config.getString("Commands.playtimetop.MAIN_CMD");
@@ -224,7 +240,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
                 .toArray(String[]::new);
     }
 
-    public Iterator<String> getConfigIterator(String path, boolean isData) {
+    public synchronized Iterator<String> getConfigIterator(String path, boolean isData) {
         final Section section = isData ? dataConfig.getSection(path) : config.getSection(path);
         if(section == null) {
             return Collections.emptyIterator();
@@ -245,31 +261,57 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         return String.valueOf(i);
     }
 
-    public long getPtFromConfig(String key) {
+    public synchronized long getPtFromConfig(String key) {
         final Optional<Long> pt = dataConfig.getOptionalLong("Player-Data." + key + ".playtime");
         return pt.isPresent() ? pt.get() : -1;
     }
 
-    public void savePtToConfig(String key, String playerName, long time) {
+    public synchronized Map<String, Long> getSavedPlaytimes() {
+        Map<String, Long> times = new HashMap<>();
+        getConfigIterator("Player-Data", true).forEachRemaining(key -> {
+            long time = getPtFromConfig(key);
+            if(time >= 0)
+                times.put(key, time);
+        });
+        return times;
+    }
+
+    public synchronized void savePtToConfig(String key, String playerName, long time) {
         dataConfig.set("Player-Data." + key + ".playtime", time);
         if(playerName != null && !playerName.isBlank())
             dataConfig.set("Player-Data." + key + ".name", playerName);
         saveData();
     }
 
-    public void saveNameToConfig(String key, String playerName) {
+    public synchronized void savePlaytimesToConfig(Map<String, Long> times, Map<String, String> names) {
+        times.forEach((key, time) -> {
+            dataConfig.set("Player-Data." + key + ".playtime", time);
+            String name = names.get(key);
+            if(name != null && !name.isBlank())
+                dataConfig.set("Player-Data." + key + ".name", name);
+        });
+        saveData();
+    }
+
+    public synchronized void saveNameToConfig(String key, String playerName) {
         if(playerName == null || playerName.isBlank())
             return;
         dataConfig.set("Player-Data." + key + ".name", playerName);
         saveData();
     }
 
-    public String getNameFromConfig(String key) {
+    public synchronized String getNameFromConfig(String key) {
         final String playerName = dataConfig.getString("Player-Data." + key + ".name");
         return playerName == null || playerName.isBlank() ? key : playerName;
     }
 
-    public String getKeyFromConfigName(String playerName) {
+    public synchronized Map<String, String> getSavedPlayerNames() {
+        Map<String, String> names = new HashMap<>();
+        getConfigIterator("Player-Data", true).forEachRemaining(key -> names.put(key, getNameFromConfig(key)));
+        return names;
+    }
+
+    public synchronized String getKeyFromConfigName(String playerName) {
         Iterator<String> iterator = getConfigIterator("Player-Data", true);
         while(iterator.hasNext()) {
             final String key = iterator.next();
@@ -279,38 +321,61 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         return null;
     }
 
-    public void removePtFromConfig(String key) {
+    public synchronized void removePtFromConfig(String key) {
         dataConfig.set("Player-Data." + key, null);
         saveData();
     }
 
     private void saveData() {
+        Path temporary = null;
         try {
-            dataConfig.save();
+            // Never truncate the live data file while serializing an autosave.
+            temporary = Files.createTempFile(dataFile.getParent(), "playtimes-", ".tmp");
+            try(FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
+                ByteBuffer bytes = StandardCharsets.UTF_8.encode(dataConfig.dump());
+                while(bytes.hasRemaining())
+                    channel.write(bytes);
+                channel.force(true);
+            }
+            try {
+                Files.move(temporary, dataFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException unsupported) {
+                Files.move(temporary, dataFile, StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException ex) {
-            throw new RuntimeException(ex);
+            throw new StorageException("Could not save playtimes.yml", ex);
+        } finally {
+            if(temporary != null) {
+                try {
+                    Files.deleteIfExists(temporary);
+                } catch (IOException cleanupFailure) {
+                    main.getLogger().warn("Could not remove temporary playtime file {}", temporary, cleanupFailure);
+                }
+            }
         }
     }
 
     public void modifyMainConfig(String path, Object value) {
         config.set(path, value);
         try {
-            config.save();
+            config.save(configFile.toFile());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    public void nullDataConfig() {
+    public synchronized void nullDataConfig() {
         dataConfig.set("Player-Data", null);
         saveData();
     }
 
     public void reloadConfig() {
         try {
-            config.reload();
+            try(InputStream input = Files.newInputStream(configFile)) {
+                config.reload(input);
+            }
             config.update();
-            config.save();
+            config.save(configFile.toFile());
             makeConfigCache();
             if(DATABASE && !main.loadDB())
                 throw new RuntimeException("Database reload failed.");

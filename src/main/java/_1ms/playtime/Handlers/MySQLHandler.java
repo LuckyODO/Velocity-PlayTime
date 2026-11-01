@@ -19,40 +19,42 @@ package _1ms.playtime.Handlers;
 import _1ms.playtime.Main;
 
 import java.sql.*;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.Iterator;
-import java.util.Set;
+import java.util.Map;
 
 public class MySQLHandler {
-
     private final ConfigHandler configHandler;
     private final Main main;
+    public Connection conn;
+
     public MySQLHandler(ConfigHandler configHandler, Main main) {
         this.configHandler = configHandler;
         this.main = main;
     }
 
-    public Connection conn;
-    public boolean openConnection() {
+    // All operations on the shared connection, including reload/reconnect, are serialized.
+    public synchronized boolean openConnection() {
+        closeConnection();
         try {
+            // Do not depend on the ordering of JDBC service files in the shaded JAR.
             Class.forName("com.mysql.cj.jdbc.Driver");
-        } catch (ClassNotFoundException ignored) {}
-
+        } catch (ClassNotFoundException missingDriver) {
+            main.getLogger().error("MySQL JDBC driver is unavailable", missingDriver);
+            return false;
+        }
         final String url = String.format(
-                "jdbc:mysql://%s:%s/%s?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC",
-                configHandler.getADDRESS(),
-                configHandler.getPORT(),
-                configHandler.getDB_NAME()
-        );
-
+                "jdbc:mysql://%s:%s/%s?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&connectTimeout=5000&socketTimeout=10000",
+                configHandler.getADDRESS(), configHandler.getPORT(), configHandler.getDB_NAME());
         try {
             conn = DriverManager.getConnection(url, configHandler.getUSERNAME(), configHandler.getPASSWORD());
             ensureSchema();
+            return true;
         } catch (SQLException e) {
+            closeConnection();
             main.getLogger().error("Error while connecting to the database: {}", e.getMessage());
             return false;
         }
-        return true;
     }
 
     private void ensureSchema() throws SQLException {
@@ -60,186 +62,168 @@ public class MySQLHandler {
             s.execute("CREATE TABLE IF NOT EXISTS playtimes (name VARCHAR(36) PRIMARY KEY, time BIGINT NOT NULL, last_name VARCHAR(16))");
             if(getColumnSize("name") < 36)
                 s.execute("ALTER TABLE playtimes MODIFY COLUMN name VARCHAR(36) NOT NULL");
-            if(!columnExists("last_name"))
+            if(getColumnSize("last_name") == 0)
                 s.execute("ALTER TABLE playtimes ADD COLUMN last_name VARCHAR(16)");
         }
     }
 
-    private boolean columnExists(String columnName) throws SQLException {
-        return getColumnSize(columnName) > 0;
-    }
-
     private int getColumnSize(String columnName) throws SQLException {
-        DatabaseMetaData metaData = conn.getMetaData();
-        try(ResultSet rs = metaData.getColumns(conn.getCatalog(), null, "playtimes", columnName)) {
-            if(rs.next())
-                return rs.getInt("COLUMN_SIZE");
+        try (ResultSet rs = conn.getMetaData().getColumns(conn.getCatalog(), null, "playtimes", columnName)) {
+            return rs.next() ? rs.getInt("COLUMN_SIZE") : 0;
         }
-        return 0;
     }
 
-    public void saveData(final String name, final String lastName, final long time) {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("INSERT INTO playtimes (name, time, last_name) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE time = ?, last_name = ?")) {
-                pstmt.setString(1, name);
-                pstmt.setLong(2, time);
-                pstmt.setString(3, lastName);
-                pstmt.setLong(4, time);
-                pstmt.setString(5, lastName);
-                pstmt.executeUpdate();
-                break;
+    @FunctionalInterface
+    private interface SqlOperation<T> {
+        T run() throws SQLException;
+    }
+
+    private synchronized <T> T execute(String operation, SqlOperation<T> action) {
+        SQLException failure = null;
+        for(int attempt = 0; attempt < 2; attempt++) {
+            try {
+                if((conn == null || conn.isClosed()) && !openConnection())
+                    throw new SQLNonTransientConnectionException("Could not open the database connection", "08001");
+                return action.run();
             } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) { //If the conn was dropped, try to reopen it once.
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while saving data into the database", e);
+                failure = e;
+                boolean connectionFailure = e instanceof SQLNonTransientConnectionException
+                        || e instanceof SQLTransientConnectionException || e instanceof SQLRecoverableException
+                        || (e.getSQLState() != null && e.getSQLState().startsWith("08"));
+                if(!connectionFailure)
+                    break;
+                closeConnection();
             }
         }
+        throw new StorageException("Database operation failed: " + operation, failure);
     }
 
-    public void saveName(final String name, final String lastName) {
+    public void saveData(String name, String lastName, long time) {
+        if(time < 0)
+            throw new IllegalArgumentException("Playtime cannot be negative");
+        execute("save playtime", () -> {
+            try (PreparedStatement s = conn.prepareStatement("INSERT INTO playtimes (name, time, last_name) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE time = ?, last_name = ?")) {
+                s.setString(1, name);
+                s.setLong(2, time);
+                s.setString(3, lastName);
+                s.setLong(4, time);
+                s.setString(5, lastName);
+                s.executeUpdate();
+            }
+            return null;
+        });
+    }
+
+    public void saveName(String name, String lastName) {
         if(lastName == null || lastName.isBlank())
             return;
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("UPDATE playtimes SET last_name = ? WHERE name = ?")) {
-                pstmt.setString(1, lastName);
-                pstmt.setString(2, name);
-                pstmt.executeUpdate();
-                break;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while saving player name into the database", e);
+        execute("save player name", () -> {
+            try (PreparedStatement s = conn.prepareStatement("UPDATE playtimes SET last_name = ? WHERE name = ?")) {
+                s.setString(1, lastName);
+                s.setString(2, name);
+                s.executeUpdate();
             }
-        }
+            return null;
+        });
     }
 
-    public long readData(final String name) {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("SELECT time FROM playtimes WHERE name = ?")) {
-                pstmt.setString(1, name);
-                try(ResultSet rs = pstmt.executeQuery()) {
-                    if(rs.next())
-                        return rs.getLong("time");
+    public long readData(String name) {
+        return execute("read playtime", () -> {
+            try (PreparedStatement s = conn.prepareStatement("SELECT time FROM playtimes WHERE name = ?")) {
+                s.setString(1, name);
+                try (ResultSet rs = s.executeQuery()) {
+                    return rs.next() ? checkedTime(rs.getLong("time")) : -1L;
                 }
-                return -1;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while reading data from the database", e);
             }
-        }
-        main.getLogger().error("DB read error - Invalid state.");
-        return -999;
+        });
     }
 
-    public String readName(final String name) {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("SELECT last_name FROM playtimes WHERE name = ?")) {
-                pstmt.setString(1, name);
-                try(ResultSet rs = pstmt.executeQuery()) {
-                    if(rs.next()) {
-                        final String lastName = rs.getString("last_name");
-                        return lastName == null || lastName.isBlank() ? name : lastName;
-                    }
-                }
-                return name;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while reading player name from the database", e);
-            }
-        }
-        main.getLogger().error("DB name read error - Invalid state.");
-        return name;
+    private long checkedTime(long time) throws SQLException {
+        if(time < 0)
+            throw new SQLException("Stored playtime is negative; refusing to load or overwrite it");
+        return time;
     }
 
-    public String findKeyByName(final String playerName) {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("SELECT name FROM playtimes WHERE LOWER(last_name) = LOWER(?)")) {
-                pstmt.setString(1, playerName);
-                try(ResultSet rs = pstmt.executeQuery()) {
-                    if(rs.next())
-                        return rs.getString("name");
-                }
-                return null;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while finding player key from the database", e);
+    public Map<String, Long> readAllTimes() {
+        return execute("read all playtimes", () -> {
+            Map<String, Long> times = new HashMap<>();
+            try (PreparedStatement s = conn.prepareStatement("SELECT name, time FROM playtimes"); ResultSet rs = s.executeQuery()) {
+                while(rs.next())
+                    times.put(rs.getString("name"), checkedTime(rs.getLong("time")));
             }
-        }
-        main.getLogger().error("DB key lookup error - Invalid state.");
-        return null;
+            return times;
+        });
+    }
+
+    public Map<String, String> readAllNames() {
+        return execute("read player names", () -> {
+            Map<String, String> names = new HashMap<>();
+            try(PreparedStatement s = conn.prepareStatement("SELECT name, last_name FROM playtimes"); ResultSet rs = s.executeQuery()) {
+                while(rs.next()) {
+                    String key = rs.getString("name");
+                    String name = rs.getString("last_name");
+                    names.put(key, name == null || name.isBlank() ? key : name);
+                }
+            }
+            return names;
+        });
+    }
+
+    public String readName(String name) {
+        return execute("read player name", () -> {
+            try (PreparedStatement s = conn.prepareStatement("SELECT last_name FROM playtimes WHERE name = ?")) {
+                s.setString(1, name);
+                try (ResultSet rs = s.executeQuery()) {
+                    String lastName = rs.next() ? rs.getString("last_name") : null;
+                    return lastName == null || lastName.isBlank() ? name : lastName;
+                }
+            }
+        });
+    }
+
+    public String findKeyByName(String playerName) {
+        return execute("find player key", () -> {
+            try (PreparedStatement s = conn.prepareStatement("SELECT name FROM playtimes WHERE LOWER(last_name) = LOWER(?)")) {
+                s.setString(1, playerName);
+                try (ResultSet rs = s.executeQuery()) {
+                    return rs.next() ? rs.getString("name") : null;
+                }
+            }
+        });
     }
 
     public Iterator<String> getIterator() {
-        final Set<String> playtimes = new HashSet<>();
-        for (int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("SELECT name FROM playtimes");
-                ResultSet rs = pstmt.executeQuery()) {
-                while (rs.next())
-                    playtimes.add(rs.getString("name"));
-                return playtimes.iterator(); //Fill up and then  ret
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    playtimes.clear(); //CLear leftovers.
-                    continue;
-                }
-                throw new RuntimeException("Error while reading data from the database", e);
-            }
-        }
-        main.getLogger().error("DB IT error - Invalid state."); //Should never reach here?
-        return null;
+        return readAllTimes().keySet().iterator();
     }
 
     public void deleteAll() {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("DELETE FROM playtimes")) {
-                pstmt.executeUpdate();
-                break;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while saving data into the database",e);
+        execute("delete all playtimes", () -> {
+            try (PreparedStatement s = conn.prepareStatement("DELETE FROM playtimes")) {
+                s.executeUpdate();
             }
-        }
+            return null;
+        });
     }
 
-    public void deleteData(final String name) {
-        for(int i = 0; i < 2; i++) {
-            try(PreparedStatement pstmt = conn.prepareStatement("DELETE FROM playtimes WHERE name = ?")) {
-                pstmt.setString(1, name);
-                pstmt.executeUpdate();
-                break;
-            } catch (SQLException e) {
-                if(e instanceof SQLNonTransientConnectionException) {
-                    openConnection();
-                    continue;
-                }
-                throw new RuntimeException("Error while deleting data from the database",e);
+    public void deleteData(String name) {
+        execute("delete playtime", () -> {
+            try (PreparedStatement s = conn.prepareStatement("DELETE FROM playtimes WHERE name = ?")) {
+                s.setString(1, name);
+                s.executeUpdate();
             }
-        }
+            return null;
+        });
     }
 
-    public void closeConnection() {
-        try {
-            if (conn != null && !conn.isClosed())
-                conn.close();
-        } catch (SQLException e) {
-            throw new RuntimeException("Error while closing connection with the database", e);
+    public synchronized void closeConnection() {
+        Connection previous = conn;
+        conn = null;
+        if(previous != null) {
+            try {
+                previous.close();
+            } catch (SQLException e) {
+                main.getLogger().warn("Error closing database connection", e);
+            }
         }
     }
 }

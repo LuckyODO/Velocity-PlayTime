@@ -25,6 +25,7 @@ import _1ms.playtime.Handlers.CacheHandler;
 import _1ms.playtime.Handlers.ConfigHandler;
 import _1ms.playtime.Handlers.MySQLHandler;
 import _1ms.playtime.Handlers.UpdateHandler;
+import _1ms.playtime.Handlers.StorageException;
 import _1ms.playtime.Listeners.PlaytimeEvents;
 import _1ms.playtime.Listeners.RequestHandler;
 import com.google.inject.Inject;
@@ -48,7 +49,7 @@ import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 
 import java.nio.file.Path;
-import java.sql.SQLException;
+import com.velocitypowered.api.scheduler.ScheduledTask;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -92,6 +93,12 @@ public class Main {
     }
 
     public final ConcurrentHashMap<String, Long> playtimeCache = new ConcurrentHashMap<>();
+    private final Map<String, String> knownNames = new ConcurrentHashMap<>();
+    private final Set<String> pendingSaves = ConcurrentHashMap.newKeySet();
+    private final List<ScheduledTask> maintenanceTasks = new ArrayList<>();
+    private boolean stopping;
+    public static final Comparator<Map.Entry<String, Long>> PLAYTIME_ORDER =
+            Map.Entry.<String, Long>comparingByValue().reversed().thenComparing(Map.Entry::getKey);
 
     @Getter
     private final Logger logger;
@@ -112,25 +119,11 @@ public class Main {
     }
 
     public boolean loadDB() {
-        if(mySQLHandler.conn != null) //For reload
-            mySQLHandler.closeConnection();
-        else
-            new org.mariadb.jdbc.Driver(); //IF first time, init driver
         logger.info("Connecting to the database...");
-        if(!mySQLHandler.openConnection())
-            return false;
-        try { //Verify conn if it didn't fail.
-            if(mySQLHandler.conn.isValid(2)) //Test conn, wait 2s
-                logger.info("Successfully connected to the database.");
-            else {
-                logger.error("Error while verifying the database connection.");
-                return false;
-            }
-        } catch (SQLException e) {
-            logger.error("Failed connecting to the database after initial connection succeeded: {}", e.getMessage());
-            return false;
-        }
-        return true;
+        boolean connected = mySQLHandler.openConnection();
+        if(connected)
+            logger.info("Successfully connected to the database.");
+        return connected;
     }
 
     @Subscribe
@@ -154,11 +147,19 @@ public class Main {
 
         if(configHandler.isUSE_CACHE()) {
             cacheHandler.buildCache();
-            proxy.getScheduler().buildTask(this, () -> {
-                cacheHandler.updateCache();
+            maintenanceTasks.add(proxy.getScheduler().buildTask(this, () -> {
+                try {
+                    cacheHandler.updateCache();
+                } catch (RuntimeException e) {
+                    logger.error("Could not refresh the playtime cache; retaining existing data", e);
+                }
                 spamH.entrySet().removeIf(entry -> (System.currentTimeMillis() - entry.getValue().time()) > configHandler.getSPAM_LIMIT() + 5000); //Clear hashmap of unneeded values
-            }).repeat(configHandler.getCACHE_UPDATE_INTERVAL(), TimeUnit.MILLISECONDS).schedule();
+            }).repeat(configHandler.getCACHE_UPDATE_INTERVAL(), TimeUnit.MILLISECONDS).schedule());
         }
+
+        maintenanceTasks.add(proxy.getScheduler().buildTask(this, this::autosave)
+                .delay(configHandler.getAUTOSAVE_INTERVAL(), TimeUnit.MILLISECONDS)
+                .repeat(configHandler.getAUTOSAVE_INTERVAL(), TimeUnit.MILLISECONDS).schedule());
 
         if(configHandler.isBSTATS()) {
             final Metrics metrics = metricsFactory.make(this, 22432);
@@ -180,10 +181,10 @@ public class Main {
         proxy.getEventManager().register(this, playtimeEvents);
         proxy.getEventManager().register(this, requestHandler);
 //Start counting PT
-        proxy.getScheduler()
+        maintenanceTasks.add(proxy.getScheduler()
                 .buildTask(this, this::countPT)
                 .repeat(1L, TimeUnit.SECONDS)
-                .schedule();
+                .schedule());
 //Register cmds
         CommandManager commandManager = proxy.getCommandManager();
         CommandMeta commandMeta = commandManager.metaBuilder(configHandler.getPTN())
@@ -258,18 +259,89 @@ public class Main {
     }
 
     @Subscribe
-    public void ProxyShutdownEvent(ProxyShutdownEvent event) {
-        saveOnlinePlayers();
+    public synchronized void ProxyShutdownEvent(ProxyShutdownEvent event) {
+        stopping = true;
+        maintenanceTasks.forEach(ScheduledTask::cancel);
+        saveCachedPlaytimes();
         mySQLHandler.closeConnection();
         logger.info("Velocity PlayTime Unloaded.");
     }
 
-    private void saveOnlinePlayers() {
+    synchronized void autosave() {
+        if(stopping)
+            return;
         for(Player player : proxy.getAllPlayers()) {
-            final String playerKey = getDataKey(player);
-            final Long playerTime = playtimeCache.get(playerKey);
-            if(playerTime != null)
-                savePt(playerKey, player.getUsername(), playerTime);
+            if(!playtimeCache.containsKey(getDataKey(player))) {
+                try {
+                    playtimeEvents.loadPlayer(player);
+                } catch (RuntimeException failure) {
+                    logger.error("Could not reload playtime for {}; keeping it unloaded", player.getUsername(), failure);
+                }
+            }
+        }
+        saveCachedPlaytimes();
+        knownNames.keySet().removeIf(key -> !playtimeCache.containsKey(key) && getPlayerByDataKey(key).isEmpty());
+    }
+
+    public void rememberPlayerName(String key, String name) {
+        knownNames.put(key, name);
+    }
+
+    public boolean hasPendingSave(String key) {
+        return pendingSaves.contains(key);
+    }
+
+    public synchronized void saveCachedPlayer(String key) {
+        // The main monitor orders every save/reset. Read the latest value only
+        // after acquiring it; never hold a cache entry lock during database I/O.
+        Long time = playtimeCache.get(key);
+        if(time == null)
+            return;
+        String name = knownNames.get(key);
+        savePt(key, name != null ? name : getDisplayName(key), time);
+        if(!configHandler.isUSE_CACHE()) {
+            playtimeCache.computeIfPresent(key, (ignored, current) -> {
+                if(current.equals(time) && getPlayerByDataKey(key).isEmpty()) {
+                    knownNames.remove(key);
+                    return null;
+                }
+                return current;
+            });
+        }
+    }
+
+    public synchronized void saveCachedPlaytimes() {
+        if(!configHandler.isDATABASE()) {
+            Map<String, Long> snapshot = new HashMap<>(playtimeCache);
+            if(snapshot.isEmpty())
+                return;
+            Map<String, String> names = new HashMap<>();
+            snapshot.keySet().forEach(key -> names.put(key, knownNames.containsKey(key) ? knownNames.get(key) : getDisplayName(key)));
+            pendingSaves.addAll(snapshot.keySet());
+            try {
+                // One complete YAML write per interval, not one full-file write per player.
+                configHandler.savePlaytimesToConfig(snapshot, names);
+                pendingSaves.removeAll(snapshot.keySet());
+                if(!configHandler.isUSE_CACHE()) {
+                    snapshot.forEach((key, saved) -> playtimeCache.computeIfPresent(key, (ignored, current) -> {
+                        if(current.equals(saved) && getPlayerByDataKey(key).isEmpty()) {
+                            knownNames.remove(key);
+                            return null;
+                        }
+                        return current;
+                    }));
+                }
+            } catch (RuntimeException e) {
+                logger.error("Could not autosave playtimes.yml; retaining cached data for retry", e);
+            }
+            return;
+        }
+        for(String key : playtimeCache.keySet()) {
+            try {
+                saveCachedPlayer(key);
+            } catch (RuntimeException e) {
+                logger.error("Could not save playtime for {}; retaining it for the next save", key, e);
+            }
         }
     }
 
@@ -329,7 +401,10 @@ public class Main {
     }
 
     public long getSavedPt(String name) {
-        return configHandler.isDATABASE() ? mySQLHandler.readData(name) : configHandler.getPtFromConfig(name);
+        long time = configHandler.isDATABASE() ? mySQLHandler.readData(name) : configHandler.getPtFromConfig(name);
+        if(time < -1)
+            throw new StorageException("Invalid saved playtime for " + name, null);
+        return time;
     }
 
     public void savePt(String name, long time) {
@@ -337,11 +412,26 @@ public class Main {
     }
 
     public void savePt(String name, String playerName, long time) {
-        if(configHandler.isDATABASE()) {
+        if(time < 0)
+            throw new IllegalArgumentException("Playtime cannot be negative");
+        pendingSaves.add(name);
+        if(configHandler.isDATABASE())
             mySQLHandler.saveData(name, playerName, time);
-            return;
-        }
-        configHandler.savePtToConfig(name, playerName, time);
+        else
+            configHandler.savePtToConfig(name, playerName, time);
+        pendingSaves.remove(name);
+    }
+
+    public Map<String, Long> getSavedPlaytimes() {
+        return configHandler.isDATABASE() ? mySQLHandler.readAllTimes() : configHandler.getSavedPlaytimes();
+    }
+
+    public Map<String, String> getSavedPlayerNames() {
+        if(!configHandler.isUSE_UUIDS()) return new HashMap<>();
+        Map<String, String> names = configHandler.isDATABASE()
+                ? mySQLHandler.readAllNames() : configHandler.getSavedPlayerNames();
+        names.putAll(knownNames);
+        return names;
     }
 
     public void savePlayerName(String key, String playerName) {
@@ -368,6 +458,14 @@ public class Main {
             return;
         }
         configHandler.nullDataConfig();
+    }
+
+    public synchronized void resetAllPlaytimes() {
+        removeAllPt();
+        playtimeCache.replaceAll((key, time) -> 0L);
+        playtimeCache.keySet().removeIf(key -> getPlayerByDataKey(key).isEmpty());
+        pendingSaves.clear();
+        knownNames.keySet().retainAll(playtimeCache.keySet());
     }
 
     public Iterator<String> getIterator() {
@@ -413,15 +511,8 @@ public class Main {
     }
 
     public int getPlace(String pName) {//Check if the cache contains it.
-        LinkedHashMap<String, Long> tl;
-        final Long cachedPlaytime = playtimeCache.get(pName);
-        if(cachedPlaytime != null) {
-            tl = doSort(null);
-            final Long lowestTopPlaytime = getLastValue(tl);
-            if (lowestTopPlaytime != null && lowestTopPlaytime > cachedPlaytime)
-                tl = requestHandler.getFullTL();
-        }
-        else
+        LinkedHashMap<String, Long> tl = doSort(null);
+        if(!tl.containsKey(pName))
             tl = requestHandler.getFullTL();
         int i = 0;
         for(String pl : tl.keySet()) {
@@ -440,7 +531,7 @@ public class Main {
             invocation.source().sendMessage(configHandler.getTOP_PLAYTIME_HEADER());
         final List<Map.Entry<String, Long>> sortedEntries = TempCache == null ? Collections.emptyList() : TempCache.entrySet().stream()
                 .filter(entry -> entry.getValue() > 0)
-                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .sorted(PLAYTIME_ORDER)
                 .limit(configHandler.getTOPLIST_LIMIT())
                 .toList();
         int place = 1;

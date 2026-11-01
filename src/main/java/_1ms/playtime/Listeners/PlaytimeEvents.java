@@ -36,11 +36,23 @@ public class PlaytimeEvents {
     }
     @Subscribe
     public EventTask onConnect(PostLoginEvent e) {
-        return EventTask.async(() -> { //Note it is async.
-            Player player = e.getPlayer();
+        return EventTask.async(() -> {
+            try {
+                loadPlayer(e.getPlayer());
+            } catch (RuntimeException failure) {
+                main.getLogger().error("Could not load playtime for {}; autosave will retry loading", e.getPlayer().getUsername(), failure);
+            }
+        });
+    }
+
+    public void loadPlayer(Player player) {
+        // Serialize loading with saves/reset, so an old disk read cannot restore
+        // a value that has just been reset or saved by a departing session.
+        synchronized(main) {
             String playerName = player.getUsername();
             String playerKey = main.getDataKey(player);
-            if(main.playtimeCache.get(playerKey) == null) {//Only put if not cached already.
+            main.rememberPlayerName(playerKey, playerName);
+            if(main.playtimeCache.get(playerKey) == null) {
                 long playtime = main.getSavedPt(playerKey);
                 if(playtime == -1 && configHandler.isUSE_UUIDS()) {
                     long legacyPlaytime = main.getSavedPt(playerName);
@@ -51,15 +63,10 @@ public class PlaytimeEvents {
                         main.playtimeCache.remove(playerName);
                     }
                 }
-                if (playtime == -1) {//Here, first time joined.
-                    main.playtimeCache.putIfAbsent(playerKey, 0L);
-                    main.savePlayerName(playerKey, playerName);
-                    return;
-                }
-                main.playtimeCache.putIfAbsent(playerKey, playtime); //LOAD pt from before.
+                main.playtimeCache.putIfAbsent(playerKey, playtime == -1 ? 0L : playtime);
             }
             main.savePlayerName(playerKey, playerName);
-        });
+        }
     }
 
     @Subscribe
@@ -68,12 +75,12 @@ public class PlaytimeEvents {
             final Player player = e.getPlayer();
             final String playerName = player.getUsername();
             final String playerKey = main.getDataKey(player);
-            final Long playerTime = main.playtimeCache.get(playerKey);
-            if(playerTime == null) //Ret if null, bugfix for when the player leaves too quickly.
-                return;
-            main.savePt(playerKey, playerName, playerTime);
-            if(!configHandler.isUSE_CACHE()) //Rem if caching isnt used, otherwise updateCache task clears it when needed
-                main.playtimeCache.remove(playerKey);
+            main.rememberPlayerName(playerKey, playerName);
+            try {
+                main.saveCachedPlayer(playerKey);
+            } catch (RuntimeException failure) {
+                main.getLogger().error("Could not save departing player {}; autosave will retry", playerName, failure);
+            }
         });
     }
 

@@ -25,6 +25,7 @@ import dev.dejvokep.boostedyaml.settings.dumper.DumperSettings;
 import dev.dejvokep.boostedyaml.settings.general.GeneralSettings;
 import dev.dejvokep.boostedyaml.settings.loader.LoaderSettings;
 import dev.dejvokep.boostedyaml.settings.updater.UpdaterSettings;
+import dev.dejvokep.boostedyaml.settings.updater.MergeRule;
 import lombok.AccessLevel;
 import lombok.Getter;
 import net.kyori.adventure.text.Component;
@@ -117,8 +118,9 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
             Files.createDirectories(dataDirectory);
             configFile = dataDirectory.resolve("config.yml");
             config = loadYaml(configFile, "/config.yml");
+            backupConfig();
             config.update();
-            config.save(configFile.toFile());
+            saveYaml(config, configFile);
 
             makeNonChanging();
             makeConfigCache();
@@ -144,9 +146,14 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
             InputStream resource = Objects.requireNonNull(getClass().getResourceAsStream(defaults))) {
             return YamlDocument.create(input, resource,
                     GeneralSettings.DEFAULT,
-                    LoaderSettings.builder().setAutoUpdate(true).build(),
+                    LoaderSettings.builder().setAutoUpdate(false).build(),
                     DumperSettings.DEFAULT,
                     UpdaterSettings.builder().setVersioning(new BasicVersioning("file-version"))
+                            .setAutoSave(false)
+                            // User-defined sections such as Rewards and Player-Data must
+                            // survive empty/null defaults and future schema upgrades.
+                            .setKeepAll(true)
+                            .setMergeRule(MergeRule.SECTION_AT_MAPPING, true)
                             .setOptionSorting(UpdaterSettings.OptionSorting.SORT_BY_DEFAULTS).build());
         }
     }
@@ -327,23 +334,37 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     private void saveData() {
+        saveYaml(dataConfig, dataFile);
+    }
+
+    private void backupConfig() throws IOException {
+        Path backup = configFile.resolveSibling("config.yml.before-1.10.3.bak");
+        if(Files.exists(configFile) && !Files.exists(backup)) {
+            // Preserve the original bytes once; subsequent starts must not replace them.
+            Files.copy(configFile, backup);
+            main.getLogger().info("Saved configuration backup to {}", backup);
+        }
+    }
+
+    private void saveYaml(YamlDocument document, Path destination) {
         Path temporary = null;
         try {
-            // Never truncate the live data file while serializing an autosave.
-            temporary = Files.createTempFile(dataFile.getParent(), "playtimes-", ".tmp");
+            // Both configuration migration and autosave must preserve the live file
+            // if serialization or writing fails.
+            temporary = Files.createTempFile(destination.getParent(), destination.getFileName() + "-", ".tmp");
             try(FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                ByteBuffer bytes = StandardCharsets.UTF_8.encode(dataConfig.dump());
+                ByteBuffer bytes = StandardCharsets.UTF_8.encode(document.dump());
                 while(bytes.hasRemaining())
                     channel.write(bytes);
                 channel.force(true);
             }
             try {
-                Files.move(temporary, dataFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(temporary, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException unsupported) {
-                Files.move(temporary, dataFile, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
             }
         } catch (IOException ex) {
-            throw new StorageException("Could not save playtimes.yml", ex);
+            throw new StorageException("Could not save " + destination.getFileName(), ex);
         } finally {
             if(temporary != null) {
                 try {
@@ -355,13 +376,14 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         }
     }
 
-    public void modifyMainConfig(String path, Object value) {
-        config.set(path, value);
+    public synchronized void modifyMainConfig(String path, Object value) {
         try {
-            config.save(configFile.toFile());
+            backupConfig();
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        config.set(path, value);
+        saveYaml(config, configFile);
     }
 
     public synchronized void nullDataConfig() {
@@ -369,13 +391,13 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         saveData();
     }
 
-    public void reloadConfig() {
+    public synchronized void reloadConfig() {
         try {
-            try(InputStream input = Files.newInputStream(configFile)) {
-                config.reload(input);
-            }
-            config.update();
-            config.save(configFile.toFile());
+            YamlDocument reloaded = loadYaml(configFile, "/config.yml");
+            backupConfig();
+            reloaded.update();
+            saveYaml(reloaded, configFile);
+            config = reloaded;
             makeConfigCache();
             if(DATABASE && !main.loadDB())
                 throw new RuntimeException("Database reload failed.");

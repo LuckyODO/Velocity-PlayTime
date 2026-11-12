@@ -29,7 +29,6 @@ import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 public class PlaytimeCommand implements SimpleCommand {
     private final Main main;
@@ -138,29 +137,19 @@ public class PlaytimeCommand implements SimpleCommand {
                 if(configHandler.isUSE_CACHE())
                     cacheHandler.updateCache();
                 if(beforePt.get() < result)
-                    checkRewards(targetName, beforePt.get(), result);
+                    checkRewards(targetKey, targetName, beforePt.get(), result);
                 sendModMsg(result, sender, targetName);
             }
             default -> sender.sendMessage(configHandler.getINVALID_ARGS());
         }
     }
 
-    private void checkRewards(String pname, long beforePt, long afterPt) {
+    private void checkRewards(String key, String pname, long beforePt, long afterPt) {
         final boolean shouldReward = main.getProxy().getPlayer(pname)
                 .map(player -> !player.hasPermission("vpt.rewards.exempt"))
                 .orElse(configHandler.isOFFLINES_SHOULD_GET_REWARDS());
-        if(!shouldReward)
-            return;
-        configHandler.getRewardsH().forEach((key, value) -> { //Check rewards on PT ADD
-            if(beforePt < key && key <= afterPt)
-                scheduleReward(pname, value);
-        });
-    }
-
-    private void scheduleReward(String pname, String command) {
-        main.getProxy().getScheduler().buildTask(main, () ->
-                main.getProxy().getCommandManager().executeAsync(main.getProxy().getConsoleCommandSource(), command.replace("%player%", pname))
-        ).delay(100, TimeUnit.MILLISECONDS).schedule();
+        if(shouldReward && main.rewardService != null)
+            main.rewardService.awardRange(key, pname, beforePt, afterPt);
     }
 
     private void sendModMsg(long val, CommandSource sender, String target) {

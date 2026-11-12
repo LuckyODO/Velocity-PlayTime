@@ -67,6 +67,12 @@ Data:
   OFFLINES_SHOULD_GET_REWARDS: false
   #Servers where you don't want pt to be counted, like your afk lobbies, etc. For ex:. EXCLUDED_SERVERS: server1,server2,server3 etc..
   EXCLUDED_SERVERS:
-#You can define your rewards under 'Rewards:' with the following format: [space]'playtime in seconds': command
+#Rewards map playtime seconds to one command OR a YAML list of commands.
+#Example: '7200': ['lpv user %player% permission set huskhomes.command.phome', 'lpv user %player% permission set huskhomes.command.tpa']
+#/ptrewards preview [seconds] checks ALL stored players; /ptrewards backfill [seconds] issues missing rewards, including offline players.
+#Admin permission: vpt.rewards.admin. Keep reward-deliveries.log when updating or moving the plugin.
+#Simple lpv permission set rewards are verified and saved via LuckPerms, including offline UUIDs.
+#Other commands have no historical receipts before this version. Backfill dispatches unrecorded commands once;
+#a successful dispatch does not prove another plugin granted the reward. Uncertain crash outcomes are not automatically retried.
 # '15': lpv user %player% parent set group #Example command.
 Rewards:

@@ -115,7 +115,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private boolean OFFLINES_SHOULD_GET_REWARDS;
     private boolean USE_UUIDS;
 
-    private final TreeMap<Long, String> rewardsH = new TreeMap<>(); //TreeMap bc it needs to be ordered by the Long
+    private final TreeMap<Long, List<String>> rewardsH = new TreeMap<>();
     private String[] excludedSrvs = {};
 
     public void initConfig(@DataDirectory Path dataDirectory) {
@@ -185,6 +185,37 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
                 throw new StorageException("Invalid configuration section: " + section, null);
         }
         validateConfigTypes(document, document.getDefaults(), "");
+        readRewards(document);
+    }
+
+    private static TreeMap<Long, List<String>> readRewards(YamlDocument document) {
+        TreeMap<Long, List<String>> result = new TreeMap<>();
+        Object root = document.get("Rewards");
+        if(root == null) return result;
+        if(!(root instanceof Section section))
+            throw new StorageException("Rewards must map seconds to a command or list of commands", null);
+        for(Object key : section.getKeys()) {
+            long seconds;
+            try {
+                seconds = Long.parseLong(String.valueOf(key));
+                if(seconds < 0 || result.containsKey(seconds)) throw new NumberFormatException();
+            } catch(NumberFormatException invalid) {
+                throw new StorageException("Invalid or duplicate reward threshold: " + key, invalid);
+            }
+            Object value = section.get(Route.from(key));
+            List<?> entries = value instanceof List<?> list ? list : Collections.singletonList(value);
+            List<String> commands = new ArrayList<>();
+            for(Object entry : entries) {
+                if(!(entry instanceof String command) || command.isBlank() || command.contains("\n") || command.contains("\r"))
+                    throw new StorageException("Reward " + key + " must contain nonempty single-line commands", null);
+                String normalized = command.strip().replaceFirst("^/", "").strip();
+                if(normalized.isEmpty()) throw new StorageException("Reward " + key + " has an empty command", null);
+                commands.add(normalized);
+            }
+            if(commands.isEmpty()) throw new StorageException("Reward " + key + " has no commands", null);
+            result.put(seconds, List.copyOf(new LinkedHashSet<>(commands)));
+        }
+        return result;
     }
 
     private void validateConfigTypes(Section actual, Section defaults, String prefix) {
@@ -241,14 +272,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         //Rewards.
         OFFLINES_SHOULD_GET_REWARDS = config.getBoolean("Data.OFFLINES_SHOULD_GET_REWARDS");
 
-        final TreeMap<Long, String> rewards = new TreeMap<>();
-        getConfigIterator("Rewards", false).forEachRemaining(key -> {
-            try {
-                rewards.put(Long.valueOf(key), config.getString("Rewards." + key));
-            } catch (NumberFormatException e) {
-                main.getLogger().warn("Ignoring invalid reward playtime '{}'. Reward keys must be seconds.", key);
-            }
-        });
+        final TreeMap<Long, List<String>> rewards = readRewards(config);
         synchronized (rewardsH) {
             rewardsH.clear();
             rewardsH.putAll(rewards);
@@ -558,7 +582,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
                 .replace("%totalseconds%", String.valueOf(main.calcTotalPT(PlayTime, 's')));
     }
 
-    public NavigableMap<Long, String> getRewardsH() {
+    public NavigableMap<Long, List<String>> getRewardsH() {
         synchronized (rewardsH) {
             return new TreeMap<>(rewardsH);
         }

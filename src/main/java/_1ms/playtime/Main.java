@@ -21,6 +21,8 @@ import _1ms.playtime.Commands.ConfigReload;
 import _1ms.playtime.Commands.PlaytimeCommand;
 import _1ms.playtime.Commands.PlaytimeResetAll;
 import _1ms.playtime.Commands.PlaytimeTopCommand;
+import _1ms.playtime.Commands.PlaytimeRewards;
+import _1ms.playtime.Rewards.RewardService;
 import _1ms.playtime.Handlers.CacheHandler;
 import _1ms.playtime.Handlers.ConfigHandler;
 import _1ms.playtime.Handlers.MySQLHandler;
@@ -37,6 +39,7 @@ import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
+import com.velocitypowered.api.plugin.Dependency;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.Player;
 import com.velocitypowered.api.proxy.ProxyServer;
@@ -60,7 +63,8 @@ import java.util.concurrent.TimeUnit;
         name = "VelocityPlaytime",
         version = BuildConstants.VERSION,
         authors = "_1ms",
-        description = "Playtime logger for velocity"
+        description = "Playtime logger for velocity",
+        dependencies = {@Dependency(id = "luckperms", optional = true)}
 )
 @SuppressWarnings("unused")
 public class Main {
@@ -74,6 +78,7 @@ public class Main {
     public UpdateHandler updateHandler;
     public PlaytimeResetAll playtimeResetAll;
     public MySQLHandler mySQLHandler;
+    public RewardService rewardService;
     public final MinecraftChannelIdentifier MCI = MinecraftChannelIdentifier.from("velocity:playtime");
 
     private final ConcurrentHashMap<String, SpamData> spamH = new ConcurrentHashMap<>();
@@ -96,7 +101,7 @@ public class Main {
     private final Map<String, String> knownNames = new ConcurrentHashMap<>();
     private final Set<String> pendingSaves = ConcurrentHashMap.newKeySet();
     private final List<ScheduledTask> maintenanceTasks = new ArrayList<>();
-    private boolean stopping;
+    private volatile boolean stopping;
     public static final Comparator<Map.Entry<String, Long>> PLAYTIME_ORDER =
             Map.Entry.<String, Long>comparingByValue().reversed().thenComparing(Map.Entry::getKey);
 
@@ -116,6 +121,11 @@ public class Main {
         InitInstances();
 
         configHandler.initConfig(dataDirectory);
+        try {
+            rewardService = new RewardService(this, dataDirectory);
+        } catch(StorageException failure) {
+            logger.error("Reward journal could not be loaded; rewards are disabled, playtime storage is unchanged", failure);
+        }
     }
 
     public boolean loadDB() {
@@ -207,6 +217,8 @@ public class Main {
                 .build();
         SimpleCommand simpleCommand4 = playtimeResetAll;
         commandManager.register(commandMeta4, simpleCommand4);
+        commandManager.register(commandManager.metaBuilder("playtimerewards").aliases("ptrewards")
+                .plugin(this).build(), new PlaytimeRewards(this));
 //Send restart packet to PlaytimeLink.
         requestHandler.sendRS();
 
@@ -214,8 +226,8 @@ public class Main {
     }
 
     void countPT() {//Playtime counting happens here.
+        if(stopping) return;
         final String[] excludedServers = configHandler.getExcludedSrvs();
-        final NavigableMap<Long, String> rewards = configHandler.getRewardsH();
         proxy.getAllPlayers().forEach(p->{
             String key = getDataKey(p);
             String pname = p.getUsername();
@@ -224,12 +236,8 @@ public class Main {
             Long newPt = playtimeCache.computeIfPresent(key, (ignored, pt) -> pt + 1L);
             if(newPt == null)
                 return;
-            rewards.forEach((rewardTime, val) -> { //And rewards
-                try {
-                    if(Objects.equals(rewardTime, newPt) && !p.hasPermission("vpt.rewards.exempt"))
-                        proxy.getCommandManager().executeAsync(proxy.getConsoleCommandSource(), val.replace("%player%", pname));
-                } catch (Exception ignored) {}
-            });
+            if(rewardService != null && !p.hasPermission("vpt.rewards.exempt"))
+                rewardService.awardRange(key, pname, newPt - 1, newPt);
         });
     }
 
@@ -252,11 +260,15 @@ public class Main {
     }
 
     @Subscribe
-    public synchronized void ProxyShutdownEvent(ProxyShutdownEvent event) {
+    public void ProxyShutdownEvent(ProxyShutdownEvent event) {
         stopping = true;
         maintenanceTasks.forEach(ScheduledTask::cancel);
-        saveCachedPlaytimes();
-        mySQLHandler.closeConnection();
+        // Do not hold the main monitor while waiting for a scan taking a snapshot.
+        if(rewardService != null) rewardService.close();
+        synchronized(this) {
+            saveCachedPlaytimes();
+            mySQLHandler.closeConnection();
+        }
         logger.info("Velocity PlayTime Unloaded.");
     }
 
@@ -425,6 +437,33 @@ public class Main {
                 ? mySQLHandler.readAllNames() : configHandler.getSavedPlayerNames();
         names.putAll(knownNames);
         return names;
+    }
+
+    public synchronized List<RewardService.Target> getRewardTargets() {
+        Map<String, Long> times = new HashMap<>(getSavedPlaytimes());
+        times.putAll(playtimeCache);
+        Map<String, String> names = new HashMap<>(getSavedPlayerNames());
+        names.putAll(knownNames);
+        for(Player player : proxy.getAllPlayers()) names.put(getDataKey(player), player.getUsername());
+        Set<String> uuidNames = new HashSet<>();
+        times.keySet().forEach(key -> {
+            if(isUuid(key)) uuidNames.add(names.getOrDefault(key, key).toLowerCase(Locale.ROOT));
+        });
+        // An old name row can survive a partially completed historical migration.
+        // Prefer the current UUID record; never add the two times together.
+        List<RewardService.Target> targets = new ArrayList<>();
+        for(var entry : times.entrySet()) {
+            String name = names.getOrDefault(entry.getKey(), entry.getKey());
+            if(!isUuid(entry.getKey()) && uuidNames.contains(name.toLowerCase(Locale.ROOT))) continue;
+            targets.add(new RewardService.Target(entry.getKey(), name, entry.getValue()));
+        }
+        targets.sort(Comparator.comparing(RewardService.Target::key));
+        return targets;
+    }
+
+    private static boolean isUuid(String key) {
+        try { return UUID.fromString(key).toString().equalsIgnoreCase(key); }
+        catch(IllegalArgumentException invalid) { return false; }
     }
 
     public void savePlayerName(String key, String playerName) {

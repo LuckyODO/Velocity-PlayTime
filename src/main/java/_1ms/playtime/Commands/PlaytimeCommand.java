@@ -176,10 +176,8 @@ public class PlaytimeCommand implements SimpleCommand {
         final String playerKey = main.getDataKey(player);
         Long PlayTime = main.playtimeCache.get(playerKey);
         if(PlayTime == null) {
-            PlayTime = main.getSavedPt(playerKey);
-            if(PlayTime == -1)
-                PlayTime = 0L;
-            main.playtimeCache.putIfAbsent(playerKey, PlayTime);
+            main.playtimeEvents.loadPlayer(player);
+            PlayTime = main.playtimeCache.get(playerKey);
         }
         player.sendMessage(configHandler.decideNonComponent(configHandler.repL(configHandler.getYOUR_PLAYTIME(), PlayTime).replace("%place%", String.valueOf(main.getPlace(playerKey)))));
     }

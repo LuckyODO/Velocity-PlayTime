@@ -21,6 +21,7 @@ import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import dev.dejvokep.boostedyaml.YamlDocument;
 import dev.dejvokep.boostedyaml.block.implementation.Section;
 import dev.dejvokep.boostedyaml.dvs.versioning.BasicVersioning;
+import dev.dejvokep.boostedyaml.route.Route;
 import dev.dejvokep.boostedyaml.settings.dumper.DumperSettings;
 import dev.dejvokep.boostedyaml.settings.general.GeneralSettings;
 import dev.dejvokep.boostedyaml.settings.loader.LoaderSettings;
@@ -32,6 +33,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 
 import java.io.InputStream;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Files;
@@ -42,6 +44,7 @@ import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 @Getter
@@ -52,6 +55,8 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     private YamlDocument dataConfig;
     @Getter(AccessLevel.NONE)
     private Path dataFile;
+    @Getter(AccessLevel.NONE)
+    private byte[] dataRevision;
     @Getter(AccessLevel.NONE)
     private Path configFile;
     @Getter(AccessLevel.NONE)
@@ -119,11 +124,11 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
             configFile = dataDirectory.resolve("config.yml");
             config = loadYaml(configFile, "/config.yml");
             backupConfig();
+            validateConfig(config);
             config.update();
-            saveYaml(config, configFile);
-
             makeNonChanging();
             makeConfigCache();
+            saveYaml(config, configFile);
 
             if(!DATABASE)
                 initDataConf(dataDirectory);
@@ -134,19 +139,26 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
 
     private void initDataConf(@DataDirectory Path dataDirectory) throws IOException {
         dataFile = dataDirectory.resolve("playtimes.yml");
-        dataConfig = loadYaml(dataFile, "/playtimes.yml");
-        dataConfig.update();
-        saveData();
+        dataRevision = Files.exists(dataFile) ? Files.readAllBytes(dataFile) : null;
+        dataConfig = parseData(dataRevision == null ? "file-version: 2\nPlayer-Data: {}\n" : new String(dataRevision, StandardCharsets.UTF_8));
+        validatePlayerData(dataConfig);
+        backupFile(dataFile);
+        // Player data is not a configuration template: do not schema-merge or
+        // rewrite existing records merely because a new plugin version starts.
+        if(dataRevision == null)
+            saveData();
     }
 
     private YamlDocument loadYaml(Path file, String defaults) throws IOException {
+        if(Files.exists(file) && Files.readString(file, StandardCharsets.UTF_8).isBlank())
+            throw new StorageException("Existing " + file.getFileName() + " is empty; refusing to replace it with defaults", null);
         // The library's File-based reload leaves its input stream open. Own the
         // streams explicitly so Windows can replace the data file on autosave.
         try(InputStream input = Files.exists(file) ? Files.newInputStream(file) : InputStream.nullInputStream();
             InputStream resource = Objects.requireNonNull(getClass().getResourceAsStream(defaults))) {
             return YamlDocument.create(input, resource,
                     GeneralSettings.DEFAULT,
-                    LoaderSettings.builder().setAutoUpdate(false).build(),
+                    LoaderSettings.builder().setAutoUpdate(false).setAllowDuplicateKeys(false).build(),
                     DumperSettings.DEFAULT,
                     UpdaterSettings.builder().setVersioning(new BasicVersioning("file-version"))
                             .setAutoSave(false)
@@ -154,7 +166,45 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
                             // survive empty/null defaults and future schema upgrades.
                             .setKeepAll(true)
                             .setMergeRule(MergeRule.SECTION_AT_MAPPING, true)
+                            .setMergeRule(MergeRule.MAPPING_AT_SECTION, true)
                             .setOptionSorting(UpdaterSettings.OptionSorting.SORT_BY_DEFAULTS).build());
+        }
+    }
+
+    private void validateConfig(YamlDocument document) {
+        if(Boolean.TRUE.equals(document.get("isDataFileUpToDate")))
+            throw new StorageException("Legacy millisecond conversion requested. Automatic conversion is disabled because an interrupted previous conversion cannot be detected safely. Verify the original units and migrate offline before setting isDataFileUpToDate to false.", null);
+        Object method = document.get("Data.DATA_METHOD");
+        if(!"YMLFILE".equals(method) && !"DATABASE".equals(method))
+            throw new StorageException("Invalid Data.DATA_METHOD; refusing to select another storage backend", null);
+        Object uuids = document.get("Data.USE_UUIDS");
+        if(!(uuids instanceof Boolean))
+            throw new StorageException("Data.USE_UUIDS must be boolean; original configuration retained", null);
+        for(String section : List.of("Data", "Commands", "Messages")) {
+            if(!(document.get(section) instanceof Section))
+                throw new StorageException("Invalid configuration section: " + section, null);
+        }
+        validateConfigTypes(document, document.getDefaults(), "");
+    }
+
+    private void validateConfigTypes(Section actual, Section defaults, String prefix) {
+        for(Object key : defaults.getKeys()) {
+            String path = prefix + key;
+            // BasicVersioning persists the version as a numeric string after update.
+            if(path.equals("file-version")) continue;
+            Object expected = defaults.get(Route.from(key));
+            Object value = actual.get(Route.from(key));
+            if(expected == null) continue; // Optional values and dynamic Rewards.
+            if(expected instanceof Section nested) {
+                if(!(value instanceof Section current))
+                    throw new StorageException("Invalid configuration section: " + path, null);
+                validateConfigTypes(current, nested, path + ".");
+            } else if((expected instanceof Boolean && !(value instanceof Boolean))
+                    || (expected instanceof String && !(value instanceof String))
+                    || (expected instanceof Number && !(value instanceof Byte || value instanceof Short
+                            || value instanceof Integer || value instanceof Long))) {
+                throw new StorageException("Invalid configuration value type: " + path, null);
+            }
         }
     }
 
@@ -182,14 +232,6 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         SPAM_LIMIT = config.getInt("Data.SPAM_LIMIT");
         INVALID_VALUE = initComp("Messages.INVALID_VALUE");
         STORAGE_ERROR = initComp("Messages.STORAGE_ERROR");
-        if(DATABASE) {
-            ADDRESS = config.getString("Data.DATABASE.ADDRESS");
-            PORT  = config.getInt("Data.DATABASE.PORT");
-            DB_NAME  = config.getString("Data.DATABASE.DB_NAME");
-            USERNAME = config.getString("Data.DATABASE.USERNAME");
-            final String cfg = config.getString("Data.DATABASE.PASSWORD");
-            PASSWORD = cfg == null ? "" : cfg;
-        }
 
         VIEW_OWN_TIME = config.getBoolean("Data.PERMISSIONS.VIEW_OWN_TIME");
         VIEW_OTHERS_TIME = config.getBoolean("Data.PERMISSIONS.VIEW_OTHERS_TIME");
@@ -224,6 +266,14 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
         CHECK_FOR_UPDATES = config.getBoolean("Data.CHECK_FOR_UPDATES");
         isDataFileUpToDate = config.getBoolean("isDataFileUpToDate");
         DATABASE = config.getString("Data.DATA_METHOD").equals("DATABASE");
+        if(DATABASE) {
+            ADDRESS = config.getString("Data.DATABASE.ADDRESS");
+            PORT  = config.getInt("Data.DATABASE.PORT");
+            DB_NAME  = config.getString("Data.DATABASE.DB_NAME");
+            USERNAME = config.getString("Data.DATABASE.USERNAME");
+            final String cfg = config.getString("Data.DATABASE.PASSWORD");
+            PASSWORD = cfg == null ? "" : cfg;
+        }
         USE_UUIDS = config.getBoolean("Data.USE_UUIDS");
         PRELOAD_PLACEHOLDERS = config.getBoolean("Data.PRELOAD_PLACEHOLDERS");
         if(USE_CACHE)
@@ -269,8 +319,56 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     public synchronized long getPtFromConfig(String key) {
-        final Optional<Long> pt = dataConfig.getOptionalLong("Player-Data." + key + ".playtime");
-        return pt.isPresent() ? pt.get() : -1;
+        // Older releases used `set(key, null)` as deletion and left null tombstones.
+        if(dataConfig.get(Route.from("Player-Data", key)) == null)
+            return -1;
+        return readTime(dataConfig, key);
+    }
+
+    private static long readTime(YamlDocument document, String key) {
+        Object value = document.get(Route.from("Player-Data", key, "playtime"));
+        if(!(value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long)
+                || ((Number) value).longValue() < 0)
+            throw new StorageException("Invalid or missing playtime for " + key + "; original data retained", null);
+        return ((Number) value).longValue();
+    }
+
+    private static void validatePlayerData(YamlDocument document) {
+        Object version = document.get("file-version");
+        if(version != null && !Set.of("1", "2").contains(String.valueOf(version)))
+            throw new StorageException("Unsupported player data version; refusing to rewrite a different schema", null);
+        if(!document.getKeys().contains("Player-Data"))
+            throw new StorageException("Missing Player-Data section; refusing to replace existing records", null);
+        Object root = document.get("Player-Data");
+        if(root == null) return;
+        if(!(root instanceof Section section))
+            throw new StorageException("Player-Data must be a mapping; original data retained", null);
+        for(Object key : section.getKeys()) {
+            if(!(key instanceof String))
+                throw new StorageException("Player identifiers must be quoted strings", null);
+            if(section.get(Route.from(key)) == null) continue;
+            readTime(document, (String) key);
+        }
+    }
+
+    private YamlDocument parseData(String text) throws IOException {
+        try(InputStream input = new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8))) {
+            return YamlDocument.create(input, GeneralSettings.DEFAULT,
+                    LoaderSettings.builder().setAutoUpdate(false).setAllowDuplicateKeys(false).build(),
+                    DumperSettings.DEFAULT);
+        }
+    }
+
+    private void mutateData(Consumer<YamlDocument> mutation) {
+        try {
+            YamlDocument candidate = parseData(dataConfig.dump());
+            mutation.accept(candidate);
+            validatePlayerData(candidate);
+            saveYaml(candidate, dataFile);
+            dataConfig = candidate;
+        } catch(IOException e) {
+            throw new StorageException("Could not prepare playtime write", e);
+        }
     }
 
     public synchronized Map<String, Long> getSavedPlaytimes() {
@@ -284,31 +382,43 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     public synchronized void savePtToConfig(String key, String playerName, long time) {
-        dataConfig.set("Player-Data." + key + ".playtime", time);
-        if(playerName != null && !playerName.isBlank())
-            dataConfig.set("Player-Data." + key + ".name", playerName);
-        saveData();
+        mutateData(candidate -> setPlayer(candidate, key, playerName, time));
+    }
+
+    private void setPlayer(YamlDocument document, String key, String name, long time) {
+        if(time < 0) throw new IllegalArgumentException("Negative playtime");
+        document.set(Route.from("Player-Data", key, "playtime"), time);
+        if(name != null && !name.isBlank())
+            document.set(Route.from("Player-Data", key, "name"), name);
     }
 
     public synchronized void savePlaytimesToConfig(Map<String, Long> times, Map<String, String> names) {
-        times.forEach((key, time) -> {
-            dataConfig.set("Player-Data." + key + ".playtime", time);
-            String name = names.get(key);
-            if(name != null && !name.isBlank())
-                dataConfig.set("Player-Data." + key + ".name", name);
-        });
-        saveData();
+        mutateData(candidate -> times.forEach((key, time) -> setPlayer(candidate, key, names.get(key), time)));
     }
 
     public synchronized void saveNameToConfig(String key, String playerName) {
-        if(playerName == null || playerName.isBlank())
-            return;
-        dataConfig.set("Player-Data." + key + ".name", playerName);
-        saveData();
+        if(playerName == null || playerName.isBlank()) return;
+        mutateData(candidate -> {
+            if(candidate.get(Route.from("Player-Data", key)) == null)
+                setPlayer(candidate, key, playerName, 0);
+            else candidate.set(Route.from("Player-Data", key, "name"), playerName);
+        });
+    }
+
+    public synchronized long migratePlayerKey(String oldKey, String newKey, String name) {
+        long existing = getPtFromConfig(newKey);
+        if(existing != -1) return existing;
+        long time = getPtFromConfig(oldKey);
+        if(time == -1) return -1;
+        mutateData(candidate -> {
+            candidate.move(Route.from("Player-Data", oldKey), Route.from("Player-Data", newKey));
+            candidate.set(Route.from("Player-Data", newKey, "name"), name);
+        });
+        return time;
     }
 
     public synchronized String getNameFromConfig(String key) {
-        final String playerName = dataConfig.getString("Player-Data." + key + ".name");
+        final String playerName = dataConfig.getString(Route.from("Player-Data", key, "name"));
         return playerName == null || playerName.isBlank() ? key : playerName;
     }
 
@@ -329,8 +439,7 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     public synchronized void removePtFromConfig(String key) {
-        dataConfig.set("Player-Data." + key, null);
-        saveData();
+        mutateData(candidate -> candidate.remove(Route.from("Player-Data", key)));
     }
 
     private void saveData() {
@@ -338,22 +447,31 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     private void backupConfig() throws IOException {
-        Path backup = configFile.resolveSibling("config.yml.before-1.10.3.bak");
-        if(Files.exists(configFile) && !Files.exists(backup)) {
-            // Preserve the original bytes once; subsequent starts must not replace them.
-            Files.copy(configFile, backup);
-            main.getLogger().info("Saved configuration backup to {}", backup);
+        backupFile(configFile);
+    }
+
+    private void backupFile(Path file) throws IOException {
+        Path backup = file.resolveSibling(file.getFileName() + ".before-1.10.4.bak");
+        if(Files.exists(file) && !Files.exists(backup)) {
+            Files.copy(file, backup);
+            main.getLogger().info("Saved original file backup to {}", backup);
         }
     }
 
     private void saveYaml(YamlDocument document, Path destination) {
         Path temporary = null;
         try {
+            if(destination.equals(dataFile)) {
+                byte[] current = Files.exists(dataFile) ? Files.readAllBytes(dataFile) : null;
+                if(!Arrays.equals(current, dataRevision))
+                    throw new StorageException("playtimes.yml changed outside the plugin; refusing to overwrite it. Stop the proxy and reconcile the file before restarting.", null);
+            }
+            String serialized = document.dump();
             // Both configuration migration and autosave must preserve the live file
             // if serialization or writing fails.
             temporary = Files.createTempFile(destination.getParent(), destination.getFileName() + "-", ".tmp");
             try(FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                ByteBuffer bytes = StandardCharsets.UTF_8.encode(document.dump());
+                ByteBuffer bytes = StandardCharsets.UTF_8.encode(serialized);
                 while(bytes.hasRemaining())
                     channel.write(bytes);
                 channel.force(true);
@@ -361,8 +479,10 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
             try {
                 Files.move(temporary, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException unsupported) {
-                Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
+                throw new IOException("Atomic file replacement is unavailable; refusing an unsafe overwrite of " + destination.getFileName(), unsupported);
             }
+            if(destination.equals(dataFile))
+                dataRevision = serialized.getBytes(StandardCharsets.UTF_8);
         } catch (IOException ex) {
             throw new StorageException("Could not save " + destination.getFileName(), ex);
         } finally {
@@ -387,20 +507,32 @@ public class ConfigHandler {//TODO REMOVE LOMBOK maybe
     }
 
     public synchronized void nullDataConfig() {
-        dataConfig.set("Player-Data", null);
-        saveData();
+        mutateData(candidate -> candidate.set("Player-Data", new LinkedHashMap<>()));
     }
 
     public synchronized void reloadConfig() {
         try {
+            if(!Files.isRegularFile(configFile))
+                throw new StorageException("config.yml is missing or unreadable; retaining the active configuration", null);
             YamlDocument reloaded = loadYaml(configFile, "/config.yml");
+            validateConfig(reloaded);
+            for(String route : List.of("Data.DATA_METHOD", "Data.USE_UUIDS", "Data.DATABASE.ADDRESS",
+                    "Data.DATABASE.PORT", "Data.DATABASE.DB_NAME", "Data.DATABASE.USERNAME", "Data.DATABASE.PASSWORD")) {
+                if(!Objects.equals(config.get(route), reloaded.get(route)))
+                    throw new StorageException("Storage/identity configuration changed at " + route + "; restart required. Existing cache remains attached to the original storage.", null);
+            }
             backupConfig();
             reloaded.update();
-            saveYaml(reloaded, configFile);
+            YamlDocument previous = config;
             config = reloaded;
-            makeConfigCache();
-            if(DATABASE && !main.loadDB())
-                throw new RuntimeException("Database reload failed.");
+            try {
+                makeConfigCache();
+                saveYaml(reloaded, configFile);
+            } catch(RuntimeException failure) {
+                config = previous;
+                makeConfigCache();
+                throw failure;
+            }
         } catch (IOException e) {
             throw new RuntimeException(e);
         }

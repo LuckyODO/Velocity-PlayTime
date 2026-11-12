@@ -138,13 +138,6 @@ public class Main {
             Thread.ofVirtual().start(updateHandler::checkForUpdates);
 
         proxy.getChannelRegistrar().register(MCI);
-//Convert old data cfgs from ms to sec. If isDataFileUpToDate has been set to true, then the plugin already ran, so there is pt, otherwise it's already been converted or never been ran.
-        if(configHandler.isDataFileUpToDate()) {
-            getLogger().info("Converting playtime from ms to seconds...");
-            getIterator().forEachRemaining(c -> savePt(c, getDisplayName(c), getSavedPt(c) / 1000));
-            configHandler.modifyMainConfig("isDataFileUpToDate", false);
-        }
-
         if(configHandler.isUSE_CACHE()) {
             cacheHandler.buildCache();
             maintenanceTasks.add(proxy.getScheduler().buildTask(this, () -> {
@@ -442,6 +435,11 @@ public class Main {
             return;
         }
         configHandler.saveNameToConfig(key, playerName);
+    }
+
+    public long migratePlayerKey(String oldKey, String newKey, String name) {
+        return configHandler.isDATABASE() ? mySQLHandler.migratePlayerKey(oldKey, newKey, name)
+                : configHandler.migratePlayerKey(oldKey, newKey, name);
     }
 
     public void removePt(String name) {

@@ -57,9 +57,7 @@ public class PlaytimeEvents {
                 if(playtime == -1 && configHandler.isUSE_UUIDS()) {
                     long legacyPlaytime = main.getSavedPt(playerName);
                     if(legacyPlaytime != -1) {
-                        playtime = legacyPlaytime;
-                        main.savePt(playerKey, playerName, legacyPlaytime);
-                        main.removePt(playerName);
+                        playtime = main.migratePlayerKey(playerName, playerKey, playerName);
                         main.playtimeCache.remove(playerName);
                     }
                 }

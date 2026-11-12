@@ -132,15 +132,16 @@ public class MySQLHandler {
             try (PreparedStatement s = conn.prepareStatement("SELECT time FROM playtimes WHERE name = ?")) {
                 s.setString(1, name);
                 try (ResultSet rs = s.executeQuery()) {
-                    return rs.next() ? checkedTime(rs.getLong("time")) : -1L;
+                    return rs.next() ? checkedTime(rs) : -1L;
                 }
             }
         });
     }
 
-    private long checkedTime(long time) throws SQLException {
-        if(time < 0)
-            throw new SQLException("Stored playtime is negative; refusing to load or overwrite it");
+    private long checkedTime(ResultSet row) throws SQLException {
+        long time = row.getLong("time");
+        if(row.wasNull() || time < 0)
+            throw new SQLException("Stored playtime is NULL or negative; refusing to load or overwrite it");
         return time;
     }
 
@@ -149,7 +150,7 @@ public class MySQLHandler {
             Map<String, Long> times = new HashMap<>();
             try (PreparedStatement s = conn.prepareStatement("SELECT name, time FROM playtimes"); ResultSet rs = s.executeQuery()) {
                 while(rs.next())
-                    times.put(rs.getString("name"), checkedTime(rs.getLong("time")));
+                    times.put(rs.getString("name"), checkedTime(rs));
             }
             return times;
         });
@@ -194,6 +195,29 @@ public class MySQLHandler {
 
     public Iterator<String> getIterator() {
         return readAllTimes().keySet().iterator();
+    }
+
+    public synchronized long migratePlayerKey(String oldKey, String newKey, String lastName) {
+        return execute("migrate player key", () -> {
+            long existing = readData(newKey);
+            if(existing != -1) return existing;
+            long original = readData(oldKey);
+            if(original == -1) return -1L;
+            // Change the primary key in ONE statement. This preserves all other
+            // columns, cannot overwrite an existing UUID, and is safe to retry
+            // after a lost acknowledgement (the target will already exist).
+            try(PreparedStatement statement = conn.prepareStatement("UPDATE playtimes SET name = ?, last_name = ? WHERE name = ?")) {
+                statement.setString(1, newKey);
+                statement.setString(2, lastName);
+                statement.setString(3, oldKey);
+                if(statement.executeUpdate() != 1)
+                    throw new SQLException("Legacy player disappeared during UUID migration; refusing to create a zero record");
+            }
+            long migrated = readData(newKey);
+            if(migrated == -1)
+                throw new SQLException("Migrated UUID record could not be read");
+            return migrated;
+        });
     }
 
     public void deleteAll() {
